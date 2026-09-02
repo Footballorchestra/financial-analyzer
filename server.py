@@ -199,6 +199,162 @@ def align_numeric_cells(ws):
             if cell.value is not None:
                 cell.alignment = Alignment(horizontal='right')
 
+def _row_to_float(value):
+    """Приводит значение ячейки к числу (0, если не число)."""
+    if value is None or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        cleaned = str(value).replace('\xa0', '').replace(' ', '').replace(',', '.')
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sort_filial_blocks_by_overdue(ws):
+    """Сортирует блоки подразделений (строки «ДТ …» с отступом 0) листа реестра
+    по убыванию просроченной задолженности (колонка O / 15).
+
+    Блок перемещается целиком: строка подразделения + все вложенные строки
+    (контрагенты/договоры/документы), сохраняя их порядок, форматирование,
+    объединённые ячейки и высоты строк. Сортировка стабильная: при равных
+    суммах блоки остаются в исходном порядке. Строка «Итого», шапка и строки
+    после «Итого» не сортируются.
+    """
+    logger.info("=== СОРТИРОВКА ПОДРАЗДЕЛЕНИЙ ПО УБЫВАНИЮ ПРОСРОЧКИ ===")
+    start = 14
+    nodes, total_row, filial_rows = build_hierarchy(ws, start_row=start)
+    if not filial_rows:
+        logger.warning("Подразделения не найдены — сортировка пропущена")
+        return
+
+    if total_row is not None:
+        data_end = total_row
+    else:
+        data_end = start
+        for r in range(start, ws.max_row + 1):
+            for c in range(1, min(ws.max_column, 30) + 1):
+                if ws.cell(row=r, column=c).value is not None:
+                    data_end = r + 1
+
+    # Собираем блоки: все строки от первого подразделения до data_end принадлежат
+    # ровно одному блоку. Новая строка «ДТ …» (отступ 0) открывает следующий блок.
+    blocks = []
+    current = None
+    for r in range(start, data_end):
+        cell_val = ws.cell(row=r, column=1).value
+        str_val = str(cell_val).strip() if cell_val is not None else ''
+        if str_val:
+            indent = get_cell_indent(ws, r)
+            if indent == 0 and str_val.startswith('ДТ '):
+                if current is not None:
+                    current['end'] = r
+                    blocks.append(current)
+                current = {'start': r, 'end': r + 1, 'filial_row': r}
+                continue
+        # вложенные строки и пустые строки прикрепляются к текущему блоку
+        if current is not None:
+            current['end'] = r + 1
+
+    if current is not None:
+        blocks.append(current)
+
+    if len(blocks) < 2:
+        logger.info("Меньше двух блоков подразделений — сортировка не требуется")
+        return
+
+    sort_start = blocks[0]['start']
+    sort_end = max(b['end'] for b in blocks)
+    blocks[-1]['end'] = sort_end
+
+    # Ключ сортировки — просроченная задолженность в строке подразделения после пересчёта
+    for b in blocks:
+        b['key'] = _row_to_float(get_cell_value(ws, b['filial_row'], COLUMNS['OVERDUE']))
+    sorted_blocks = sorted(blocks, key=lambda b: b['key'], reverse=True)
+
+    # Новый порядок физических строк (перемещаются целые блоки)
+    old_rows = [r for b in blocks for r in range(b['start'], b['end'])]
+    new_rows = [r for b in sorted_blocks for r in range(b['start'], b['end'])]
+    if sorted(old_rows) != list(range(sort_start, sort_end)):
+        logger.warning("Блоки не покрывают диапазон строк — сортировка пропущена")
+        return
+    row_map = {old: new for old, new in zip(old_rows, new_rows)}
+
+    # Снимок содержимого строк и высот ДО очистки
+    cells_snapshot = []
+    for r in old_rows:
+        row_cells = []
+        for c in range(1, ws.max_column + 1):
+            if (r, c) in ws._cells:
+                row_cells.append((c, ws._cells[(r, c)]))
+        cells_snapshot.append((r, row_cells))
+
+    row_props = {}
+    for r in old_rows:
+        if r in ws.row_dimensions:
+            rd = ws.row_dimensions[r]
+            row_props[r] = (rd.height, rd.hidden, rd.outlineLevel, rd.collapsed)
+
+    # Объединённые ячейки внутри сортируемого диапазона (переносятся вместе со строками).
+    # Переносим только те, что целиком лежат в одном блоке (одинаковый сдвиг обеих границ).
+    merge_map = []
+    for rng in list(ws.merged_cells.ranges):
+        if rng.min_row >= sort_start and rng.max_row < sort_end:
+            d_min = row_map[rng.min_row] - rng.min_row
+            d_max = row_map[rng.max_row] - rng.max_row
+            if d_min == d_max:
+                merge_map.append((rng, d_min))
+            else:
+                logger.warning(f"Объединение {rng} пересекает границы блоков — не переносится")
+    for rng, _ in merge_map:
+        ws.merged_cells.remove(rng)
+
+    # Очищаем диапазон: удаляем старые ячейки и свойства строк
+    for key in [k for k in list(ws._cells) if sort_start <= k[0] < sort_end]:
+        del ws._cells[key]
+    for r in range(sort_start, sort_end):
+        if r in ws.row_dimensions:
+            del ws.row_dimensions[r]
+
+    # Записываем строки в новом порядке (значения, стили, гиперссылки, высоты)
+    for old_row, row_cells in cells_snapshot:
+        new_row = row_map[old_row]
+        for col, src_cell in row_cells:
+            dst_cell = ws.cell(row=new_row, column=col)
+            dst_cell.value = src_cell.value
+            if src_cell.has_style:
+                dst_cell.font = copy(src_cell.font)
+                dst_cell.border = copy(src_cell.border)
+                dst_cell.fill = copy(src_cell.fill)
+                dst_cell.number_format = src_cell.number_format
+                dst_cell.alignment = copy(src_cell.alignment)
+                dst_cell.protection = copy(src_cell.protection)
+            if src_cell.hyperlink:
+                dst_cell.hyperlink = src_cell.hyperlink
+        if old_row in row_props:
+            height, hidden, outline, collapsed = row_props[old_row]
+            rd = ws.row_dimensions[new_row]
+            rd.height = height
+            rd.hidden = hidden
+            rd.outlineLevel = outline
+            rd.collapsed = collapsed
+
+    # Восстанавливаем объединённые ячейки на новых местах
+    for rng, delta in merge_map:
+        ws.merge_cells(
+            start_row=rng.min_row + delta,
+            start_column=rng.min_col,
+            end_row=rng.max_row + delta,
+            end_column=rng.max_col
+        )
+
+    logger.info(
+        f"Отсортировано блоков подразделений: {len(blocks)} "
+        f"(строки {sort_start}–{sort_end - 1}) по убыванию просрочки"
+    )
+
+
 def get_cell_value(ws, row, col):
     if is_cell_merged(ws, row, col):
         cell = get_cell_to_write(ws, row, col)
@@ -626,6 +782,15 @@ def save_excel():
             logger.info("Нет обновлённых строк")
 
         align_numeric_cells(ws)
+
+        # Сортировка блоков подразделений по убыванию просроченной задолженности.
+        # Выполняется после пересчёта итогов, чтобы учитывать актуальные суммы
+        # (в т.ч. подразделения, где после сверки просрочка стала 0 — уходят вниз).
+        try:
+            sort_filial_blocks_by_overdue(ws)
+        except Exception as e:
+            logger.error(f"Ошибка сортировки подразделений: {e}")
+            traceback.print_exc()
 
         current_day_data_from_file = extract_filial_overdue(ws)
         data['currentDayData'] = current_day_data_from_file
