@@ -1009,7 +1009,6 @@ def build_email_data(data, current_day_data, total_debt, total_overdue, siuat_to
         {'label': 'общая ДЗ', 'value': _fmt(total_debt)},
         {'label': 'из них ПДЗ', 'value': _fmt(total_overdue)},
         {'label': 'в т.ч. Судебная', 'value': _fmt(summary_dt.get('legal', 0))},
-        {'label': 'подлежащая к взысканию', 'value': _fmt(summary_dt.get('recoverable', 0))},
     ]
 
     summary_siuat_rows = [
@@ -1125,7 +1124,6 @@ def create_summary_sheet(ws, data, total_debt=0, total_overdue=0, siuat_total_de
         ('общая ДЗ', total_debt),
         ('из них ПДЗ', total_overdue),
         ('в т.ч. Судебная', summary_dt.get('legal', 0)),
-        ('подлежащая к взысканию', summary_dt.get('recoverable', 0)),
     ]
     for label, value in rows_dt:
         cl = ws.cell(row=row, column=1, value=label)

@@ -14,14 +14,12 @@ class DebtReconciliationManager {
         this.siUatFile = null;         // файл СИ УАТ
         this.siUatFileName = '';       // имя файла СИ УАТ
         this.summaryDT = {             // свод задолженности ДТ
-            legal: 0,
-            recoverable: 0
+            legal: 0
         };
         this.summarySIUAT = {          // свод задолженности СИ УАТ
             totalDebt: 0,
             totalOverdue: 0,
-            legal: 0,
-            recoverable: 0
+            legal: 0
         };
         this.currentSubdivisionData = {}; // данные текущего дня по филиалам
 
@@ -55,7 +53,7 @@ class DebtReconciliationManager {
 
     // ✅ НОВЫЙ МЕТОД: Загрузка данных предыдущего дня из БД через API
     // ИЗМЕНЕНИЕ: Сервер теперь сам находит последнюю доступную дату, если запрошенная не найдена
-    // ИЗМЕНЕНИЕ 2: Теперь загружает также сводные данные (legal, recoverable)
+    // ИЗМЕНЕНИЕ 2: Теперь загружает также сводные данные (legal)
     async loadPreviousDayDataFromAPI(requestedDate, options = {}) {
         try {
             console.log(`📥 Загрузка данных за ${requestedDate} из БД...`);
@@ -87,8 +85,7 @@ class DebtReconciliationManager {
                 // для текущего дня (иначе письмо/файл получит вчерашние сводные как сегодняшние)
                 if (!options.preserveSummary && result.summaryDT) {
                     this.summaryDT = {
-                        legal: result.summaryDT.legal || 0,
-                        recoverable: result.summaryDT.recoverable || 0
+                        legal: result.summaryDT.legal || 0
                     };
                     this.saveSummaryData();
                     console.log('✅ Загружены сводные данные ДТ из БД');
@@ -98,8 +95,7 @@ class DebtReconciliationManager {
                     this.summarySIUAT = {
                         totalDebt: result.summarySIUAT.totalDebt || 0,
                         totalOverdue: result.summarySIUAT.totalOverdue || 0,
-                        legal: result.summarySIUAT.legal || 0,
-                        recoverable: result.summarySIUAT.recoverable || 0
+                        legal: result.summarySIUAT.legal || 0
                     };
                     this.saveSummaryData();
                     console.log('✅ Загружены сводные данные СИ УАТ из БД');
@@ -225,10 +221,9 @@ class DebtReconciliationManager {
             if (dtData) {
                 const parsed = JSON.parse(dtData);
                 if (parsed && typeof parsed === 'object') {
-                    // Позиция «Не подлежащая к взысканию» больше не используется
+                    // Категории «не подлежащая/подлежащая к взысканию» больше не используются
                     this.summaryDT = {
-                        legal: parsed.legal || 0,
-                        recoverable: parsed.recoverable || 0
+                        legal: parsed.legal || 0
                     };
                 }
             }
@@ -239,8 +234,7 @@ class DebtReconciliationManager {
                 this.summarySIUAT = {
                     totalDebt: parsed.totalDebt || 0,
                     totalOverdue: parsed.totalOverdue || 0,
-                    legal: parsed.legal || 0,
-                    recoverable: parsed.recoverable || 0
+                    legal: parsed.legal || 0
                 };
             }
         } catch (e) {
@@ -614,7 +608,7 @@ class DebtReconciliationManager {
     }
 
     // ✅ ИЗМЕНЕНИЕ: Сохранение данных сверки в PostgreSQL для дашборда
-    // Теперь включает сводные данные (legal, recoverable)
+    // Теперь включает сводные данные (legal)
     async saveToDashboardDB(filialData) {
         try {
             const swipeDate = this.formatDate(this.currentDate);
@@ -1307,14 +1301,12 @@ class DebtReconciliationManager {
             summaryDT: {
                 totalDebt: totalDebt,
                 totalOverdue: totalOverdue,
-                legal: this.summaryDT.legal,
-                recoverable: this.summaryDT.recoverable
+                legal: this.summaryDT.legal
             },
             summarySIUAT: {
                 totalDebt: this.summarySIUAT.totalDebt || 0,
                 totalOverdue: this.summarySIUAT.totalOverdue || 0,
-                legal: this.summarySIUAT.legal,
-                recoverable: this.summarySIUAT.recoverable
+                legal: this.summarySIUAT.legal
             },
             siUatFileName: this.siUatFileName || ''
         };

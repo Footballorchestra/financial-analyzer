@@ -242,8 +242,7 @@ class App {
                 // ✅ ИСПРАВЛЕНИЕ: Загружаем сводные данные из ответа API
                 if (result.summaryDT) {
                     this.debtManager.summaryDT = {
-                        legal: result.summaryDT.legal || 0,
-                        recoverable: result.summaryDT.recoverable || 0
+                        legal: result.summaryDT.legal || 0
                     };
                     this.debtManager.saveSummaryData();
                     console.log('✅ Загружены сводные данные ДТ из БД:', this.debtManager.summaryDT);
@@ -253,8 +252,7 @@ class App {
                     this.debtManager.summarySIUAT = {
                         totalDebt: result.summarySIUAT.totalDebt || 0,
                         totalOverdue: result.summarySIUAT.totalOverdue || 0,
-                        legal: result.summarySIUAT.legal || 0,
-                        recoverable: result.summarySIUAT.recoverable || 0
+                        legal: result.summarySIUAT.legal || 0
                     };
                     this.debtManager.saveSummaryData();
                     console.log('✅ Загружены сводные данные СИ УАТ из БД:', this.debtManager.summarySIUAT);
@@ -1188,12 +1186,10 @@ class App {
     openSummarySettingsModal() {
         // Заполняем поля сводных данных
         document.getElementById('summaryDtLegal').value = this.debtManager.summaryDT.legal || '';
-        document.getElementById('summaryDtRecoverable').value = this.debtManager.summaryDT.recoverable || '';
 
         document.getElementById('summarySiuatTotalDebt').value = this.debtManager.summarySIUAT.totalDebt || '';
         document.getElementById('summarySiuatTotalOverdue').value = this.debtManager.summarySIUAT.totalOverdue || '';
         document.getElementById('summarySiuatLegal').value = this.debtManager.summarySIUAT.legal || '';
-        document.getElementById('summarySiuatRecoverable').value = this.debtManager.summarySIUAT.recoverable || '';
 
         // Заполняем дату предыдущего дня
         const previousInfo = this.debtManager.getPreviousDayData();
@@ -1286,16 +1282,14 @@ class App {
     async saveSummarySettings() {
         // Сохраняем сводные данные ДТ
         this.debtManager.summaryDT = {
-            legal: parseFloat(document.getElementById('summaryDtLegal').value) || 0,
-            recoverable: parseFloat(document.getElementById('summaryDtRecoverable').value) || 0
+            legal: parseFloat(document.getElementById('summaryDtLegal').value) || 0
         };
 
         // Сохраняем сводные данные СИ УАТ
         this.debtManager.summarySIUAT = {
             totalDebt: parseFloat(document.getElementById('summarySiuatTotalDebt').value) || 0,
             totalOverdue: parseFloat(document.getElementById('summarySiuatTotalOverdue').value) || 0,
-            legal: parseFloat(document.getElementById('summarySiuatLegal').value) || 0,
-            recoverable: parseFloat(document.getElementById('summarySiuatRecoverable').value) || 0
+            legal: parseFloat(document.getElementById('summarySiuatLegal').value) || 0
         };
 
         // ✅ ИСПРАВЛЕНИЕ: Отправляем сводные данные на сервер в БД
