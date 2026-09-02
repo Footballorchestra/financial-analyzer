@@ -1094,6 +1094,9 @@ class App {
             const result = await this.debtManager.sendToEmail();
             if (result.success) {
                 this.showNotification(result.message, 'success');
+                // После отправки писем снимок текущего дня сохранён — обновляем индикатор,
+                // чтобы показать дату, которая станет «предыдущим днём» для следующей сверки
+                this.updatePreviousDayIndicator();
             } else {
                 this.showNotification(result.message, 'error');
             }

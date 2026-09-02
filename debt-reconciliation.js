@@ -58,7 +58,7 @@ class DebtReconciliationManager {
     // ✅ НОВЫЙ МЕТОД: Загрузка данных предыдущего дня из БД через API
     // ИЗМЕНЕНИЕ: Сервер теперь сам находит последнюю доступную дату, если запрошенная не найдена
     // ИЗМЕНЕНИЕ 2: Теперь загружает также сводные данные (legal, notRecoverable, recoverable)
-    async loadPreviousDayDataFromAPI(requestedDate) {
+    async loadPreviousDayDataFromAPI(requestedDate, options = {}) {
         try {
             console.log(`📥 Загрузка данных за ${requestedDate} из БД...`);
             
@@ -81,7 +81,9 @@ class DebtReconciliationManager {
                 }));
                 
                 // ✅ ИЗМЕНЕНИЕ: Загружаем сводные данные если они есть в ответе
-                if (result.summaryDT) {
+                // preserveSummary=true — не перезаписываем сводные значения, введённые пользователем
+                // для текущего дня (иначе письмо/файл получит вчерашние сводные как сегодняшние)
+                if (!options.preserveSummary && result.summaryDT) {
                     this.summaryDT = {
                         legal: result.summaryDT.legal || 0,
                         notRecoverable: result.summaryDT.notRecoverable || 0,
@@ -91,7 +93,7 @@ class DebtReconciliationManager {
                     console.log('✅ Загружены сводные данные ДТ из БД');
                 }
                 
-                if (result.summarySIUAT) {
+                if (!options.preserveSummary && result.summarySIUAT) {
                     this.summarySIUAT = {
                         totalDebt: result.summarySIUAT.totalDebt || 0,
                         totalOverdue: result.summarySIUAT.totalOverdue || 0,
@@ -103,8 +105,11 @@ class DebtReconciliationManager {
                     console.log('✅ Загружены сводные данные СИ УАТ из БД');
                 }
                 
-                // Обновляем текущие данные
-                this.currentSubdivisionData = result.data;
+                // Обновляем текущие данные (если не запрошено сохранение текущего дня —
+                // например, при подстановке «предыдущего дня» перед формированием писем)
+                if (!options.preserveCurrentData) {
+                    this.currentSubdivisionData = result.data;
+                }
                 
                 return { 
                     success: true, 
@@ -1248,8 +1253,11 @@ class DebtReconciliationManager {
         return changed;
     }
 
-    _prepareSummaryData() {
-        const previousDayInfo = this.getPreviousDayData();
+    _prepareSummaryData(overrides) {
+        // overrides.previousDayInfo / previousDayData / previousDate позволяют подставить
+        // свежие данные предыдущего дня из БД вместо (возможно устаревшего) localStorage
+        const opts = overrides || {};
+        const previousDayInfo = opts.previousDayInfo || this.getPreviousDayData();
         const totalDebt = this.stats.totalDebt || 0;
         let totalOverdue = 0;
         for (const filial in this.currentSubdivisionData) {
@@ -1259,10 +1267,10 @@ class DebtReconciliationManager {
 
         return {
             updatedDocuments: this.processedDocuments,
-            previousDayData: previousDayInfo.data,
+            previousDayData: opts.previousDayData !== undefined ? opts.previousDayData : previousDayInfo.data,
             currentDayData: this.currentSubdivisionData,
             currentDate: this.formatDate(this.currentDate),
-            previousDate: previousDayInfo.date || 'предыдущий рабочий день',
+            previousDate: opts.previousDate !== undefined ? opts.previousDate : (previousDayInfo.date || 'предыдущий рабочий день'),
             summaryDT: {
                 totalDebt: totalDebt,
                 totalOverdue: totalOverdue,
@@ -1279,6 +1287,32 @@ class DebtReconciliationManager {
             },
             siUatFileName: this.siUatFileName || ''
         };
+    }
+
+    // Обновить данные «предыдущего дня» из БД перед формированием файла/писем.
+    // Сервер сам находит последний доступный снимок (вчера/позже нет данных → последний
+    // рабочий день), поэтому таблица динамики не остаётся с устаревшей датой из localStorage
+    // (например, когда вкладка была открыта несколько дней и БД уже пополнилась).
+    // preserveSummary + preserveCurrentData: не затираем введённые сегодня сводные значения
+    // и текущие данные по филиалам.
+    async _refreshPreviousDayDataForSummary() {
+        const yesterday = new Date(this.currentDate.getTime() - 24 * 60 * 60 * 1000);
+        const yesterdayStr = this.formatDate(yesterday);
+        try {
+            const apiResult = await this.loadPreviousDayDataFromAPI(yesterdayStr, {
+                preserveSummary: true,
+                preserveCurrentData: true
+            });
+            if (apiResult.success && apiResult.data && Object.keys(apiResult.data).length > 0) {
+                console.log(`✅ Данные предыдущего дня для динамики обновлены из БД: ${apiResult.date}`);
+                return { data: apiResult.data, date: apiResult.date || yesterdayStr };
+            }
+            console.log('⚠️ В БД нет данных предыдущего дня, используем localStorage');
+        } catch (e) {
+            console.warn('⚠️ Не удалось обновить данные предыдущего дня из БД:', e.message);
+        }
+        const local = this.getPreviousDayData();
+        return { data: local.data, date: local.date };
     }
 
     async exportToExcel() {
@@ -1310,7 +1344,9 @@ class DebtReconciliationManager {
             const formData = new FormData();
             formData.append('file', this.debtFile);
 
-            const summaryData = this._prepareSummaryData();
+            // Подставляем свежие данные предыдущего дня из БД (если страница открыта давно)
+            const previousDayInfo = await this._refreshPreviousDayDataForSummary();
+            const summaryData = this._prepareSummaryData({ previousDayInfo: previousDayInfo });
 
             // Если файл СИ УАТ загружен — добавляем его
             if (this.siUatFile) {
@@ -1817,7 +1853,11 @@ class DebtReconciliationManager {
             const formData = new FormData();
             formData.append('file', this.debtFile);
             formData.append('mode', 'email');
-            const summaryData = this._prepareSummaryData();
+            // Берём актуальные данные предыдущего дня из БД (последний доступный снимок),
+            // а не устаревшие из localStorage — иначе «Динамика по подразделениям» застревает
+            // на дате последнего сохранённого в БД дня (например, 26.08.2026)
+            const previousDayInfo = await this._refreshPreviousDayDataForSummary();
+            const summaryData = this._prepareSummaryData({ previousDayInfo: previousDayInfo });
             if (this.siUatFile) {
                 formData.append('siUatFile', this.siUatFile);
             }
@@ -1891,6 +1931,44 @@ class DebtReconciliationManager {
                 const filename = 'Письмо_' + (index + 1) + '_ДЗ_Транспорт_' + dateDDMMYYYY + '.eml';
                 setTimeout(() => this._downloadEml(content, filename), index * 400);
             });
+
+            // === СОХРАНЕНИЕ СНИМКА ТЕКУЩЕГО ДНЯ (как в exportToExcel) ===
+            // Без этого цепочка «предыдущий день» обрывается: снимки перестают попадать в БД,
+            // и на следующий день динамика сравнивается с последним сохранённым днём
+            // (на практике — с датой последнего использования кнопки «Сохранить», 26.08.2026).
+            try {
+                const filialDataHeader = serverResponse.headers.get('X-Filial-Data');
+                let serverFilialData = null;
+                let serverDataAvailable = false;
+                if (filialDataHeader) {
+                    try {
+                        // atob() возвращает Latin-1, поэтому конвертируем байты через TextDecoder
+                        const binary = atob(filialDataHeader);
+                        const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+                        const jsonStr = new TextDecoder('utf-8').decode(bytes);
+                        serverFilialData = JSON.parse(jsonStr);
+                        if (serverFilialData && Object.keys(serverFilialData).length > 0) {
+                            serverDataAvailable = true;
+                        }
+                    } catch (e) {
+                        console.warn('⚠️ Не удалось распарсить заголовок X-Filial-Data:', e);
+                    }
+                }
+                // Используем серверные данные (точнее клиентских расчётов) с fallback на локальные
+                const dataToSave = serverDataAvailable ? serverFilialData : this.currentSubdivisionData;
+                if (dataToSave && Object.keys(dataToSave).length > 0) {
+                    this.currentSubdivisionData = dataToSave;
+                    // localStorage — чтобы сверка работала даже при недоступной БД
+                    this.saveCurrentDayData();
+                    // PostgreSQL — источник данных для дашборда и «предыдущего дня» в других браузерах
+                    await this.saveToDashboardDB(dataToSave);
+                    console.log('✅ Данные текущего дня сохранены (localStorage + БД) для использования как «предыдущий день»');
+                } else {
+                    console.warn('⚠️ Нет данных для сохранения снимка текущего дня');
+                }
+            } catch (saveError) {
+                console.error('❌ Ошибка сохранения данных текущего дня после отправки письма:', saveError);
+            }
 
             return { success: true, message: 'Сформировано 3 письма (.eml). Проверьте загрузки браузера.' };
         } catch (error) {
