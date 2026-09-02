@@ -223,12 +223,6 @@ def sort_filial_blocks_by_overdue(ws):
     после «Итого» не сортируются.
     """
     logger.info("=== СОРТИРОВКА ПОДРАЗДЕЛЕНИЙ ПО УБЫВАНИЮ ПРОСРОЧКИ ===")
-    # Диагностика: первые строки данных (как выглядит реестр до сортировки)
-    for r in range(14, min(20, ws.max_row + 1)):
-        v = ws.cell(row=r, column=1).value
-        if v is not None:
-            ind = get_cell_indent(ws, r)
-            logger.info(f"  start_row {r}: indent={ind} {str(v).strip()[:60]}")
     start = 14
     nodes, total_row, filial_rows = build_hierarchy(ws, start_row=start)
     if not filial_rows:
@@ -266,12 +260,6 @@ def sort_filial_blocks_by_overdue(ws):
     if current is not None:
         blocks.append(current)
 
-    # Диагностика: список собранных блоков с ключами ДО сортировки
-    logger.info("Собранные блоки (до сортировки):")
-    for i, b in enumerate(blocks):
-        nm = str(ws.cell(row=b['filial_row'], column=1).value).strip()
-        logger.info(f"  block[{i}] start={b['start']} end={b['end']} имя={nm}")
-
     if len(blocks) < 2:
         logger.info("Меньше двух блоков подразделений — сортировка не требуется")
         return
@@ -285,19 +273,18 @@ def sort_filial_blocks_by_overdue(ws):
         b['key'] = _row_to_float(get_cell_value(ws, b['filial_row'], COLUMNS['OVERDUE']))
     sorted_blocks = sorted(blocks, key=lambda b: b['key'], reverse=True)
 
-    # Диагностика: ключи и порядок после сортировки
-    logger.info("Отсортированные блоки (первые 12):")
-    for i, b in enumerate(sorted_blocks[:12]):
-        nm = str(ws.cell(row=b['filial_row'], column=1).value).strip()
-        logger.info(f"  sorted[{i}] start={b['start']} имя={nm} key={b['key']:,.2f}")
-
     # Новый порядок физических строк (перемещаются целые блоки)
     old_rows = [r for b in blocks for r in range(b['start'], b['end'])]
     new_rows = [r for b in sorted_blocks for r in range(b['start'], b['end'])]
     if sorted(old_rows) != list(range(sort_start, sort_end)):
         logger.warning("Блоки не покрывают диапазон строк — сортировка пропущена")
         return
-    row_map = {old: new for old, new in zip(old_rows, new_rows)}
+    # ВАЖНО: соответствие «старая строка -> новая строка» нельзя строить через
+    # zip(old_rows, new_rows): это ставит в соответствие старой строке «старый номер»
+    # другой строки, а не номер новой позиции (ломается при блоках разного размера).
+    # Правильно: содержимое строки row (которая в новом порядке стоит на позиции p)
+    # должно быть записано на строку (sort_start + p).
+    row_map = {row: sort_start + p for p, row in enumerate(new_rows)}
 
     # Снимок содержимого строк и высот ДО очистки
     cells_snapshot = []
