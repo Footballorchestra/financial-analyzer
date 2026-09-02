@@ -349,6 +349,17 @@ def sort_filial_blocks_by_overdue(ws):
             end_column=rng.max_col
         )
 
+    # Диагностика: фактический порядок строк подразделений после перестановки
+    order_lines = []
+    for r in range(sort_start, sort_end):
+        cell_val = ws.cell(row=r, column=1).value
+        if cell_val and str(cell_val).strip().startswith('ДТ '):
+            order_lines.append(
+                f"{str(cell_val).strip()}={_row_to_float(get_cell_value(ws, r, COLUMNS['OVERDUE'])):,.2f}"
+            )
+    if order_lines:
+        logger.info("Порядок в файле после сортировки: " + " | ".join(order_lines))
+
     logger.info(
         f"Отсортировано блоков подразделений: {len(blocks)} "
         f"(строки {sort_start}–{sort_end - 1}) по убыванию просрочки"
