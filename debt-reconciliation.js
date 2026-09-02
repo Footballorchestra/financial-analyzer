@@ -15,14 +15,12 @@ class DebtReconciliationManager {
         this.siUatFileName = '';       // имя файла СИ УАТ
         this.summaryDT = {             // свод задолженности ДТ
             legal: 0,
-            notRecoverable: 0,
             recoverable: 0
         };
         this.summarySIUAT = {          // свод задолженности СИ УАТ
             totalDebt: 0,
             totalOverdue: 0,
             legal: 0,
-            notRecoverable: 0,
             recoverable: 0
         };
         this.currentSubdivisionData = {}; // данные текущего дня по филиалам
@@ -57,7 +55,7 @@ class DebtReconciliationManager {
 
     // ✅ НОВЫЙ МЕТОД: Загрузка данных предыдущего дня из БД через API
     // ИЗМЕНЕНИЕ: Сервер теперь сам находит последнюю доступную дату, если запрошенная не найдена
-    // ИЗМЕНЕНИЕ 2: Теперь загружает также сводные данные (legal, notRecoverable, recoverable)
+    // ИЗМЕНЕНИЕ 2: Теперь загружает также сводные данные (legal, recoverable)
     async loadPreviousDayDataFromAPI(requestedDate, options = {}) {
         try {
             console.log(`📥 Загрузка данных за ${requestedDate} из БД...`);
@@ -90,7 +88,6 @@ class DebtReconciliationManager {
                 if (!options.preserveSummary && result.summaryDT) {
                     this.summaryDT = {
                         legal: result.summaryDT.legal || 0,
-                        notRecoverable: result.summaryDT.notRecoverable || 0,
                         recoverable: result.summaryDT.recoverable || 0
                     };
                     this.saveSummaryData();
@@ -102,7 +99,6 @@ class DebtReconciliationManager {
                         totalDebt: result.summarySIUAT.totalDebt || 0,
                         totalOverdue: result.summarySIUAT.totalOverdue || 0,
                         legal: result.summarySIUAT.legal || 0,
-                        notRecoverable: result.summarySIUAT.notRecoverable || 0,
                         recoverable: result.summarySIUAT.recoverable || 0
                     };
                     this.saveSummaryData();
@@ -227,7 +223,14 @@ class DebtReconciliationManager {
         try {
             const dtData = localStorage.getItem('summaryDT');
             if (dtData) {
-                this.summaryDT = JSON.parse(dtData);
+                const parsed = JSON.parse(dtData);
+                if (parsed && typeof parsed === 'object') {
+                    // Позиция «Не подлежащая к взысканию» больше не используется
+                    this.summaryDT = {
+                        legal: parsed.legal || 0,
+                        recoverable: parsed.recoverable || 0
+                    };
+                }
             }
             const siuatData = localStorage.getItem('summarySIUAT');
             if (siuatData) {
@@ -237,7 +240,6 @@ class DebtReconciliationManager {
                     totalDebt: parsed.totalDebt || 0,
                     totalOverdue: parsed.totalOverdue || 0,
                     legal: parsed.legal || 0,
-                    notRecoverable: parsed.notRecoverable || 0,
                     recoverable: parsed.recoverable || 0
                 };
             }
@@ -612,7 +614,7 @@ class DebtReconciliationManager {
     }
 
     // ✅ ИЗМЕНЕНИЕ: Сохранение данных сверки в PostgreSQL для дашборда
-    // Теперь включает сводные данные (legal, notRecoverable, recoverable)
+    // Теперь включает сводные данные (legal, recoverable)
     async saveToDashboardDB(filialData) {
         try {
             const swipeDate = this.formatDate(this.currentDate);
@@ -1306,14 +1308,12 @@ class DebtReconciliationManager {
                 totalDebt: totalDebt,
                 totalOverdue: totalOverdue,
                 legal: this.summaryDT.legal,
-                notRecoverable: this.summaryDT.notRecoverable,
                 recoverable: this.summaryDT.recoverable
             },
             summarySIUAT: {
                 totalDebt: this.summarySIUAT.totalDebt || 0,
                 totalOverdue: this.summarySIUAT.totalOverdue || 0,
                 legal: this.summarySIUAT.legal,
-                notRecoverable: this.summarySIUAT.notRecoverable,
                 recoverable: this.summarySIUAT.recoverable
             },
             siUatFileName: this.siUatFileName || ''
