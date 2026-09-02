@@ -74,11 +74,15 @@ class DebtReconciliationManager {
                 const actualDate = result.date || requestedDate;
                 console.log(`✅ Загружено ${Object.keys(result.data).length} филиалов из БД за ${actualDate}`);
                 
-                // Сохраняем в localStorage для кэша и офлайн-работы с ПРАВИЛЬНОЙ датой
-                localStorage.setItem('previousDayDebt_manual', JSON.stringify({
-                    data: result.data,
-                    date: actualDate
-                }));
+                // Сохраняем в localStorage для кэша и офлайн-работы с ПРАВИЛЬНОЙ датой.
+                // updateLocalStorage=false — вызывающий сам решит, что записать (например,
+                // когда локально есть более свежие вручную загруженные данные за конкретный день)
+                if (options.updateLocalStorage !== false) {
+                    localStorage.setItem('previousDayDebt_manual', JSON.stringify({
+                        data: result.data,
+                        date: actualDate
+                    }));
+                }
                 
                 // ✅ ИЗМЕНЕНИЕ: Загружаем сводные данные если они есть в ответе
                 // preserveSummary=true — не перезаписываем сводные значения, введённые пользователем
@@ -466,7 +470,10 @@ class DebtReconciliationManager {
     }
 
     // Загрузка данных предыдущего дня из Excel файла (полная замена данных)
-    async loadPreviousDayDataFromFile(file) {
+    // options.date — дата из поля «Дата предыдущего дня» (используется, если
+    // в имени файла дата не распознана)
+    async loadPreviousDayDataFromFile(file, options) {
+        const opts = options || {};
         console.log('Загрузка данных предыдущего дня из файла:', file.name);
         try {
             const arrayBuffer = await this.readFileAsArrayBuffer(file);
@@ -524,18 +531,23 @@ class DebtReconciliationManager {
                 return { success: false, message: 'Не найдено данных для загрузки' };
             }
 
+            // Дата «предыдущего дня»: сначала ищем в имени файла (обычно
+            // «ДЗ Транспорт 01.09.2026.xlsx»), не нашли — берём из поля настроек
+            const detectedDate = this._extractDateYYYYMMDD(file.name) ||
+                this._extractDateYYYYMMDD(opts.date || '') || '';
+
             // Полная замена: удаляем старые данные и записываем новые
             try {
                 const payload = {
                     data: previousDayData,
-                    date: '',
+                    date: detectedDate,
                     // ✅ ИЗМЕНЕНИЕ: Сохраняем текущие сводные данные
                     summaryDT: this.summaryDT,
                     summarySIUAT: this.summarySIUAT
                 };
                 // Не кодируем — localStorage поддерживает UTF-8
                 localStorage.setItem('previousDayDebt_manual', JSON.stringify(payload));
-                console.log(`Данные предыдущего дня полностью заменены: ${parsedCount} записей, общая сумма: ${totalAmount.toFixed(2)}`);
+                console.log(`Данные предыдущего дня полностью заменены: ${parsedCount} записей, общая сумма: ${totalAmount.toFixed(2)}, дата: ${detectedDate || 'не указана'}`);
             } catch (e) {
                 console.error('Ошибка сохранения в localStorage:', e);
                 return { success: false, message: 'Ошибка сохранения данных: ' + e.message };
@@ -544,14 +556,15 @@ class DebtReconciliationManager {
             // Обновляем currentSubdivisionData для отображения в таблице
             this.currentSubdivisionData = previousDayData;
 
-            console.log(`Загружено ${parsedCount} записей:`, previousDayData);
+            console.log(`Загружено ${parsedCount} записей за ${detectedDate || 'неизвестную дату'}:`, previousDayData);
 
             return {
                 success: true,
                 message: `Загружено ${parsedCount} подразделений. Общая сумма: ${totalAmount.toFixed(2)}`,
                 data: previousDayData,
                 count: parsedCount,
-                total: totalAmount
+                total: totalAmount,
+                date: detectedDate
             };
         } catch (error) {
             console.error('Ошибка загрузки файла:', error);
@@ -703,6 +716,24 @@ class DebtReconciliationManager {
         const month = String(d.getMonth() + 1).padStart(2, '0');
         const day = String(d.getDate()).padStart(2, '0');
         return year + '-' + month + '-' + day;
+    }
+
+    // Извлекает дату в формате YYYY-MM-DD из произвольной строки (имя файла, поле input date).
+    // Распознаёт «01.09.2026», «1.9.2026» и «2026-09-01». Возвращает '' если дата не найдена.
+    _extractDateYYYYMMDD(text) {
+        if (!text) return '';
+        const str = String(text);
+        let m = str.match(/(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/);
+        if (m) {
+            const day = String(Number(m[1])).padStart(2, '0');
+            const month = String(Number(m[2])).padStart(2, '0');
+            return m[3] + '-' + month + '-' + day;
+        }
+        m = str.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+        if (m) {
+            return m[1] + '-' + String(Number(m[2])).padStart(2, '0') + '-' + String(Number(m[3])).padStart(2, '0');
+        }
+        return '';
     }
 
     clearData() {
@@ -1298,20 +1329,38 @@ class DebtReconciliationManager {
     async _refreshPreviousDayDataForSummary() {
         const yesterday = new Date(this.currentDate.getTime() - 24 * 60 * 60 * 1000);
         const yesterdayStr = this.formatDate(yesterday);
+        // Локальные данные могут быть свежее последнего снимка БД: пользователь вручную
+        // загрузил файл за 01.09, а в БД последний снимок 26.08 (пропущенные дни).
+        const local = this.getPreviousDayData();
+        const localHasData = !!(local.data && Object.keys(local.data).length > 0);
         try {
             const apiResult = await this.loadPreviousDayDataFromAPI(yesterdayStr, {
                 preserveSummary: true,
-                preserveCurrentData: true
+                preserveCurrentData: true,
+                updateLocalStorage: false // не затираем localStorage до решения ниже
             });
             if (apiResult.success && apiResult.data && Object.keys(apiResult.data).length > 0) {
-                console.log(`✅ Данные предыдущего дня для динамики обновлены из БД: ${apiResult.date}`);
-                return { data: apiResult.data, date: apiResult.date || yesterdayStr };
+                const dbDate = apiResult.date || yesterdayStr;
+                // Если локально лежат данные за более позднюю дату, чем последний снимок БД,
+                // оставляем их — иначе динамика «откатится» на старую дату (26.08)
+                if (localHasData && local.date && local.date > dbDate) {
+                    console.log(`ℹ️ В БД последний снимок за ${dbDate}, но локально загружены данные за ${local.date} — используем локальные (свежее)`);
+                    return { data: local.data, date: local.date, source: 'localStorage-newer' };
+                }
+                // Применяем данные из БД и кэшируем их в localStorage
+                localStorage.setItem('previousDayDebt_manual', JSON.stringify({
+                    data: apiResult.data,
+                    date: dbDate,
+                    summaryDT: this.summaryDT,
+                    summarySIUAT: this.summarySIUAT
+                }));
+                console.log(`✅ Данные предыдущего дня для динамики обновлены из БД: ${dbDate}`);
+                return { data: apiResult.data, date: dbDate, source: 'database' };
             }
             console.log('⚠️ В БД нет данных предыдущего дня, используем localStorage');
         } catch (e) {
             console.warn('⚠️ Не удалось обновить данные предыдущего дня из БД:', e.message);
         }
-        const local = this.getPreviousDayData();
         return { data: local.data, date: local.date };
     }
 

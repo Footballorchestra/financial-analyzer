@@ -228,7 +228,17 @@ class App {
             if (result.success && result.data && Object.keys(result.data).length > 0) {
                 const actualDate = result.date || dateStr;
                 console.log(`✅ Загружено ${Object.keys(result.data).length} филиалов из БД за ${actualDate}`);
-                
+
+                // Если локально (вручную из файла) загружены данные за более позднюю дату,
+                // чем последний снимок в БД, БД не перетирает их (иначе после загрузки
+                // файла за 01.09 система снова показывает 26.08)
+                const localInfo = this.debtManager.getPreviousDayData();
+                const localData = localInfo.data || {};
+                if (Object.keys(localData).length > 0 && localInfo.date && localInfo.date > actualDate) {
+                    console.log(`ℹ️ Локально загружены данные за ${localInfo.date} — они свежее последнего снимка БД (${actualDate}). Данные из БД не применяем.`);
+                    return { success: true, data: localData, date: localInfo.date, source: 'localStorage-newer' };
+                }
+
                 // ✅ ИСПРАВЛЕНИЕ: Загружаем сводные данные из ответа API
                 if (result.summaryDT) {
                     this.debtManager.summaryDT = {
@@ -596,11 +606,14 @@ class App {
         previousDayFileInput.addEventListener('change', async (e) => {
             if (e.target.files.length > 0) {
                 const file = e.target.files[0];
-                const result = await this.loadPreviousDayDataFromFile(file);
+                // Передаём дату из поля «Дата предыдущего дня», если в имени файла её нет
+                const dateInput = document.getElementById('previousDayDateInput');
+                const result = await this.loadPreviousDayDataFromFile(file, { date: dateInput ? dateInput.value : '' });
 
                 if (result.success) {
-                    // Обновляем информацию о файле
-                    previousDayFileInfo.innerHTML = `<i class="fas fa-check-circle" style="color: var(--success);"></i> ${file.name} (${result.count} ДТ, ${this.formatCurrency(result.total)})`;
+                    // Обновляем информацию о файле (с датой, если она определена)
+                    const dateLabel = result.date ? ` за ${result.date}` : '';
+                    previousDayFileInfo.innerHTML = `<i class="fas fa-check-circle" style="color: var(--success);"></i> ${file.name}${dateLabel} (${result.count} ДТ, ${this.formatCurrency(result.total)})`;
 
                     // Обновляем таблицу
                     this.renderPreviousDayDataTable();
@@ -681,16 +694,19 @@ class App {
                     const result = await this.debtManager.loadPreviousDayDataFromAPI(date);
                     
                     if (result.success) {
+                        // Показываем ФАКТИЧЕСКУЮ дату из БД: если за 01.09 данных нет,
+                        // сервер вернёт последний доступный снимок (например, 26.08)
+                        const actualDate = result.date || date;
                         // Обновляем информацию о файле
-                        previousDayFileInfo.innerHTML = `<i class="fas fa-database" style="color: var(--success);"></i> Загружено из БД: ${date} (${Object.keys(result.data).length} ДТ)`;
-                        
+                        previousDayFileInfo.innerHTML = `<i class="fas fa-database" style="color: var(--success);"></i> Загружено из БД: ${actualDate} (${Object.keys(result.data).length} ДТ)`;
+
                         // Обновляем таблицу
                         this.renderPreviousDayDataTable();
-                        
+
                         // Обновляем индикатор
                         this.updatePreviousDayIndicator();
-                        
-                        this.showNotification(`Загружено ${Object.keys(result.data).length} филиалов за ${date}`, 'success');
+
+                        this.showNotification(`Загружено ${Object.keys(result.data).length} филиалов за ${actualDate}`, 'success');
                     } else {
                         this.showNotification(result.message || 'Ошибка загрузки данных', 'error');
                     }
@@ -1144,15 +1160,16 @@ class App {
     }
 
     // Загрузка данных предыдущего дня из Excel файла
-    async loadPreviousDayDataFromFile(file) {
+    async loadPreviousDayDataFromFile(file, options) {
         this.showLoading();
         try {
-            const result = await this.debtManager.loadPreviousDayDataFromFile(file);
+            const result = await this.debtManager.loadPreviousDayDataFromFile(file, options || {});
             const fileInfoEl = document.getElementById('previousDayFileInfo');
 
             if (result.success) {
+                const dateLabel = result.date ? ` за ${result.date}` : '';
                 fileInfoEl.innerHTML =
-                    `<i class="fas fa-check-circle" style="color: var(--success);"></i> ${file.name} (${result.count} ДТ, ${this.formatCurrency(result.total)})`;
+                    `<i class="fas fa-check-circle" style="color: var(--success);"></i> ${file.name}${dateLabel} (${result.count} ДТ, ${this.formatCurrency(result.total)})`;
                 this.showNotification(result.message, 'success');
             } else {
                 fileInfoEl.innerHTML =
