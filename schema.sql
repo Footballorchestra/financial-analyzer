@@ -133,6 +133,41 @@ CREATE TABLE IF NOT EXISTS term_deposits (
 CREATE INDEX IF NOT EXISTS idx_term_deposits_account ON term_deposits(account_number);
 CREATE INDEX IF NOT EXISTS idx_term_deposits_end_date ON term_deposits(end_date);
 
+-- Таблица 10: Контроль лимитов платежей поставщикам
+-- Одна строка = один подтверждённый платёж/заявка загрузки.
+-- Месяц и период (P1..P4) определяются по дате подтверждения (дате загрузки файла),
+-- а НЕ по дате платежа из файла.
+CREATE TABLE IF NOT EXISTS payment_limits_payments (
+    id SERIAL PRIMARY KEY,
+    limit_month DATE NOT NULL,               -- 'YYYY-MM-01' — месяц учёта (по дате подтверждения)
+    period SMALLINT NOT NULL CHECK (period BETWEEN 1 AND 4),  -- P1..P4 по дате подтверждения
+    confirmed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, -- дата подтверждения
+    article VARCHAR(255) NOT NULL,           -- Статья движения денежных средств
+    detail_limit VARCHAR(255) DEFAULT '',    -- подстатья / детальный лимит (для «Аренда, Коммуналка, Связь»)
+    amount NUMERIC(20, 2) NOT NULL DEFAULT 0,-- сумма из файла, рубли
+    recipient VARCHAR(500) DEFAULT '',
+    request_no VARCHAR(255) DEFAULT '',
+    request_date DATE,
+    status VARCHAR(255) DEFAULT '',
+    organization VARCHAR(255) DEFAULT '',
+    subdivision VARCHAR(255) DEFAULT '',
+    priority VARCHAR(100) DEFAULT '',
+    purpose TEXT DEFAULT '',
+    payment_date DATE,
+    applicant VARCHAR(255) DEFAULT '',
+    payment_type VARCHAR(255) DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_plp_month_period ON payment_limits_payments(limit_month, period);
+CREATE INDEX IF NOT EXISTS idx_plp_article ON payment_limits_payments(article);
+
+-- Таблица 11: Настройки лимитов платежей (редактируются в интерфейсе; одна строка id = 1)
+CREATE TABLE IF NOT EXISTS payment_limits_config (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    config JSONB NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Комментарии
 COMMENT ON TABLE swipe_history IS 'История сверок дебиторской задолженности — сводка по дате';
 COMMENT ON TABLE filial_snapshots IS 'Снимки данных по филиалам (ДТ) на дату сверки';
@@ -142,3 +177,5 @@ COMMENT ON TABLE contractors_library IS 'Библиотека контраген
 COMMENT ON TABLE exclusion_rules IS 'Правила исключения транзакций из отчётов (фильтрация)';
 COMMENT ON TABLE categorization_rules IS 'Правила категоризации — автоопределение категории по содержимому поля';
 COMMENT ON TABLE company_aliases IS 'Синонимы названий компаний для унификации';
+COMMENT ON TABLE payment_limits_payments IS 'Контроль лимитов платежей поставщикам — подтверждённые платежи (месяц/период по дате подтверждения)';
+COMMENT ON TABLE payment_limits_config IS 'Настройки лимитов платежей поставщикам (редактируются в интерфейсе, JSONB)';

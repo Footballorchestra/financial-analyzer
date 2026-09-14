@@ -223,6 +223,77 @@ class BalancesManager {
         window.app.showNotification('Проценты рассчитаны', 'success');
     }
 
+    // Сегодняшняя дата в формате YYYY-MM-DD (локальная)
+    todayIso() {
+        const d = new Date();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${d.getFullYear()}-${m}-${day}`;
+    }
+
+    // Следующий рабочий день после указанной даты (пропускаем субботу и воскресенье)
+    getNextWorkingDayIso(dateStr) {
+        const base = dateStr || this.todayIso();
+        const [y, m, d] = base.split('-').map(Number);
+        const date = new Date(y, m - 1, d);
+        do {
+            date.setDate(date.getDate() + 1);
+        } while (date.getDay() === 0 || date.getDay() === 6); // 0 — воскресенье, 6 — суббота
+        const mm = String(date.getMonth() + 1).padStart(2, '0');
+        const dd = String(date.getDate()).padStart(2, '0');
+        return `${date.getFullYear()}-${mm}-${dd}`;
+    }
+
+    // Форматирование ISO-даты в ДД.ММ.ГГГГ для уведомлений
+    formatDateRu(dateStr) {
+        if (!dateStr) return '';
+        const [y, m, d] = dateStr.split('-');
+        return `${d}.${m}.${y}`;
+    }
+
+    // Продление всех срочных (длинных) депозитов: от текущего дня до следующего рабочего дня
+    async extendTermDepositsToNextWorkingDay() {
+        try {
+            const calcInput = document.getElementById('calculationDate');
+            const startDate = (calcInput && calcInput.value) ? calcInput.value : this.todayIso();
+            const endDate = this.getNextWorkingDayIso(startDate);
+
+            const accounts = Object.keys(this.storage.getDepositData());
+            let accountsChanged = 0;
+            let depositsChanged = 0;
+
+            accounts.forEach(account => {
+                const deposits = this.storage.getDepositForAccount(account);
+                let changed = false;
+                const updated = deposits.map(dep => {
+                    if (!dep.endDate) return dep; // обычные (без даты окончания) не трогаем
+                    changed = true;
+                    depositsChanged++;
+                    return { ...dep, startDate, endDate };
+                });
+                if (changed) {
+                    this.storage.setDepositForAccount(account, updated);
+                    accountsChanged++;
+                }
+            });
+
+            if (depositsChanged === 0) {
+                window.app.showNotification('Срочные (длинные) депозиты не найдены', 'info');
+                return;
+            }
+
+            await this.storage.syncDepositsToServer();
+            this.updateTable();
+            window.app.showNotification(
+                `Продлено срочных депозитов: ${depositsChanged} (на ${accountsChanged} счетах) — период ${this.formatDateRu(startDate)}–${this.formatDateRu(endDate)}`,
+                'success'
+            );
+        } catch (error) {
+            console.error('Ошибка продления депозитов на следующий рабочий день:', error);
+            window.app.showNotification('Ошибка продления депозитов', 'error');
+        }
+    }
+
     // Мержит депозит из Excel с существующими депозитами
     // Обычные депозиты (без endDate) — суммируются, срочные — сохраняются
     mergeExcelDeposit(account, excelDeposit) {

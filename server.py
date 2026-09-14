@@ -1189,7 +1189,7 @@ def build_email_data(data, current_day_data, total_debt, total_overdue, siuat_to
     summary_dt_rows = [
         {'label': 'общая ДЗ', 'value': _fmt(total_debt)},
         {'label': 'из них ПДЗ', 'value': _fmt(total_overdue)},
-        {'label': 'в т.ч. Судебная', 'value': _fmt(summary_dt.get('legal', 0))},
+        {'label': 'Судебная задолженность (Промстрой, АккаунтЭксперт, МКСталь)', 'value': _fmt(summary_dt.get('legal', 0))},
     ]
 
     summary_siuat_rows = [
@@ -1304,7 +1304,7 @@ def create_summary_sheet(ws, data, total_debt=0, total_overdue=0, siuat_total_de
     rows_dt = [
         ('общая ДЗ', total_debt),
         ('из них ПДЗ', total_overdue),
-        ('в т.ч. Судебная', summary_dt.get('legal', 0)),
+        ('Судебная задолженность (Промстрой, АккаунтЭксперт, МКСталь)', summary_dt.get('legal', 0)),
     ]
     for label, value in rows_dt:
         cl = ws.cell(row=row, column=1, value=label)
@@ -2234,6 +2234,198 @@ def api_sync_term_deposits():
         logger.error(f"Ошибка API term-deposits/sync: {e}")
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+# ============================================================
+# API КОНТРОЛЯ ЛИМИТОВ ПЛАТЕЖЕЙ ПОСТАВЩИКАМ
+# ============================================================
+
+def payment_period_for_date(dt):
+    """Период оплаты по дате загрузки: P1 (1-7), P2 (8-15), P3 (16-22), P4 (23-31)."""
+    day = dt.day
+    if day <= 7:
+        return 1
+    if day <= 15:
+        return 2
+    if day <= 22:
+        return 3
+    return 4
+
+
+def _parse_plp_date(value):
+    """Конвертирует значение даты (ISO-строка или None) в str YYYY-MM-DD или None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Оставляем только дату из ISO 'YYYY-MM-DD...'
+    s = s[:10]
+    try:
+        datetime.strptime(s, '%Y-%m-%d')
+        return s
+    except ValueError:
+        return None
+
+
+@app.route('/api/payment-limits/config', methods=['GET'])
+def api_payment_limits_config_get():
+    """Возвращает настройки лимитов платежей (категории, значения, подстатьи, глобальный лимит)."""
+    try:
+        config = db.get_payment_limits_config()
+        return jsonify({'success': True, 'config': config})
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/config GET: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/config', methods=['POST'])
+@app.route('/api/payment-limits/config/save', methods=['POST'])
+def api_payment_limits_config_save():
+    """
+    Сохраняет настройки лимитов (названия, значения по периодам, подстатьи, глобальный лимит).
+    При переименовании категорий/подстатей обновляет уже подтверждённые платежи в БД.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        config = data.get('config')
+        result = db.save_payment_limits_config(config)
+        if not result.get('success'):
+            return jsonify(result), 400
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/config POST: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/confirmed', methods=['GET'])
+def api_payment_limits_confirmed():
+    """
+    Подтверждённые платежи за месяц (для накопительного итога в превью).
+
+    Query param: month=YYYY-MM (по умолчанию — текущий месяц).
+    При первом обращении в новом месяце автоматически удаляет данные
+    предыдущих месяцев (начало нового месяца — учёт заново).
+    """
+    try:
+        now = datetime.now()
+        month = request.args.get('month')
+        if not month:
+            month = now.strftime('%Y-%m')
+
+        month_first = month[:7] + '-01'
+        db.cleanup_payment_limits_before(month_first)
+
+        rows = db.get_payment_limits_payments(month_first)
+        # Денормализуем значения дат/сумм в JSON-совместимый вид
+        result = []
+        for r in rows:
+            item = dict(r)
+            for key in ('request_date', 'payment_date'):
+                val = item.get(key)
+                if val is not None:
+                    item[key] = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+            for key in ('limit_month',):
+                val = item.get(key)
+                if val is not None:
+                    item[key] = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+            for key in ('confirmed_at',):
+                val = item.get(key)
+                if val is not None:
+                    item[key] = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+            item['amount'] = float(item.get('amount') or 0)
+            result.append(item)
+
+        return jsonify({
+            'success': True,
+            'month': month_first,
+            'period': payment_period_for_date(now),
+            'rows': result
+        })
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/confirmed: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/confirm', methods=['POST'])
+def api_payment_limits_confirm():
+    """
+    Подтверждение и сохранение загрузки платежей.
+
+    Тело: JSON {'rows': [ {...}, ... ], 'period': 1..4 (необязательно)}.
+    Период берётся из запроса (выбор пользователя в интерфейсе), если он валиден;
+    иначе определяется по ДАТЕ ПОДТВЕРЖДЕНИЯ на сервере.
+    Месяц учёта — по дате подтверждения. При смене месяца данные предыдущих
+    месяцев автоматически очищаются.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        rows = data.get('rows') or []
+        if not rows:
+            return jsonify({'success': False, 'error': 'Нет данных для сохранения'}), 400
+
+        now = datetime.now()
+        month_first = now.strftime('%Y-%m') + '-01'
+
+        # Период: выбранный пользователем (1..4) или авто по дате подтверждения
+        period = None
+        try:
+            if data.get('period') is not None:
+                period = int(data.get('period'))
+        except (TypeError, ValueError):
+            period = None
+        if period is None or period < 1 or period > 4:
+            period = payment_period_for_date(now)
+
+        # Автоочистка: начало нового месяца — начинаем учёт заново
+        db.cleanup_payment_limits_before(month_first)
+
+        payments = []
+        for row in rows:
+            payments.append({
+                'limit_month': month_first,
+                'period': period,
+                'article': (row.get('article') or '').strip(),
+                'detail_limit': (row.get('detail_limit') or '').strip(),
+                'amount': float(row.get('amount') or 0),
+                'recipient': (row.get('recipient') or '').strip(),
+                'request_no': (row.get('request_no') or '').strip(),
+                'request_date': _parse_plp_date(row.get('request_date')),
+                'status': (row.get('status') or '').strip(),
+                'organization': (row.get('organization') or '').strip(),
+                'subdivision': (row.get('subdivision') or '').strip(),
+                'priority': (row.get('priority') or '').strip(),
+                'purpose': (row.get('purpose') or '').strip(),
+                'payment_date': _parse_plp_date(row.get('payment_date')),
+                'applicant': (row.get('applicant') or '').strip(),
+                'payment_type': (row.get('payment_type') or '').strip()
+            })
+
+        result = db.insert_payment_limits_payments(payments)
+        if not result.get('success'):
+            return jsonify(result), 500
+
+        total_amount = sum(p['amount'] for p in payments)
+        logger.info(
+            f"✅ Подтверждено платежей по лимитам: {result['count']} шт., "
+            f"сумма {total_amount:.2f} ₽, период P{period}, месяц {month_first}"
+        )
+        return jsonify({
+            'success': True,
+            'month': month_first,
+            'period': period,
+            'count': result['count'],
+            'total_amount': total_amount,
+            'message': f'Подтверждено {result["count"]} платежей '
+                       f'(период P{period}, {month_first[:7]})'
+        })
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/confirm: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     logger.info("Сервер запущен на http://0.0.0.0:5000")

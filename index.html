@@ -50,6 +50,10 @@
                     <i class="fas fa-truck"></i>
                     <span class="sidebar-nav-text">Оплаты поставщикам</span>
                 </button>
+                <button class="sidebar-nav-btn" data-page="payment-limits">
+                    <i class="fas fa-gauge-high"></i>
+                    <span class="sidebar-nav-text">Лимиты платежей</span>
+                </button>
                 <button class="sidebar-nav-btn" data-page="cashflow">
                     <i class="fas fa-money-bill-wave"></i>
                     <span class="sidebar-nav-text">ДДС по подразделениям</span>
@@ -581,6 +585,9 @@
                                 <i class="fas fa-coins"></i> Загрузить депозиты
                             </button>
                             <input type="file" id="depositFileUpload" accept=".txt,.xlsx,.xls" style="display: none;">
+                            <button id="nextWorkingDayBtn" class="btn btn-secondary" title="Продлить все срочные депозиты до следующего рабочего дня">
+                                <i class="fas fa-calendar-plus"></i> Следующий рабочий день
+                            </button>
                             <button id="exportBalancesBtn" class="btn btn-success">
                                 <i class="fas fa-file-excel"></i> Экспорт в Excel
                             </button>
@@ -863,6 +870,62 @@
                             </div>
                         </div>
                         <div id="suppliersDataArea"></div>
+                    </div>
+                </div>
+
+                <!-- Страница: Контроль лимитов платежей поставщикам -->
+                <div id="payment-limits-page" class="page" style="display: none;">
+                    <div class="page-header">
+                        <div>
+                            <h1><i class="fas fa-gauge-high"></i> Лимиты платежей поставщикам</h1>
+                            <p class="page-description">Контроль лимитов платежей по статьям и периодам (P1–P4) с подтверждением и сохранением в базу данных</p>
+                        </div>
+                        <div class="header-actions">
+                            <label class="pl-switch" title="При включении доступным считается только лимит текущего периода: неиспользованный остаток предыдущего периода не переносится">
+                                <input type="checkbox" id="plOnlyCurrentPeriod">
+                                <span>Только текущий период</span>
+                            </label>
+                            <button id="plLimitsSettingsBtn" class="btn btn-secondary">
+                                <i class="fas fa-sliders-h"></i> Настроить лимиты
+                            </button>
+                            <div class="pl-header-info">
+                                <span class="pl-info-item"><i class="fas fa-calendar-day"></i> Текущая дата: <strong id="plHeaderDate">—</strong></span>
+                                <span class="pl-info-item"><i class="fas fa-hourglass-half"></i> Период загрузки: <strong id="plHeaderPeriod">—</strong></span>
+                                <span class="pl-info-item"><i class="fas fa-calendar-alt"></i> Месяц учёта: <strong id="plHeaderMonth">—</strong></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Зона загрузки файла: простая кнопка -->
+                    <div id="plUploadZone" class="pl-upload-zone">
+                        <button id="uploadPaymentLimitsBtn" class="btn btn-primary">
+                            <i class="fas fa-file-excel"></i> Загрузить файл Excel
+                        </button>
+                        <input type="file" id="paymentLimitsFileUpload" accept=".xlsx,.xls" style="display: none;">
+                        <label class="pl-period-select" title="Выберите период, в который будут загружены платежи из файла">
+                            <span>Период загрузки:</span>
+                            <select id="plLoadPeriod">
+                                <option value="">Авто (по дате загрузки)</option>
+                                <option value="1">Период 1 (1–7 числа)</option>
+                                <option value="2">Период 2 (8–15 числа)</option>
+                                <option value="3">Период 3 (16–22 числа)</option>
+                                <option value="4">Период 4 (23–31 числа)</option>
+                            </select>
+                        </label>
+                        <span class="pl-empty-hint" id="plEmptyHint"></span>
+                    </div>
+
+                    <!-- Контрольная панель: подтверждённые данные из БД + превью -->
+                    <div id="plControlArea"></div>
+
+                    <!-- Кнопки подтверждения -->
+                    <div id="plActions" class="pl-actions" style="display: none;">
+                        <button id="confirmPaymentLimitsBtn" class="btn btn-success">
+                            <i class="fas fa-check-circle"></i> Подтвердить и сохранить
+                        </button>
+                        <button id="cancelPaymentLimitsBtn" class="btn btn-secondary">
+                            <i class="fas fa-times"></i> Отменить
+                        </button>
                     </div>
                 </div>
 
@@ -1470,7 +1533,7 @@
                 </h4>
                 <div style="display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 20px;">
                     <div>
-                        <label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; display: block; margin-bottom: 4px;">в т.ч. Судебная</label>
+                        <label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; display: block; margin-bottom: 4px;">Не включая судебную задолженность (Промстрой, АккаунтЭксперт, МКСталь)</label>
                         <input type="number" id="summaryDtLegal" step="0.01" placeholder="Сумма" style="width: 100%; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); font-size: 13px;">
                     </div>
                 </div>
@@ -1491,7 +1554,7 @@
                         <input type="number" id="summarySiuatTotalOverdue" step="0.01" placeholder="Из файла или вручную" style="width: 100%; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); font-size: 13px;">
                     </div>
                     <div>
-                        <label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; display: block; margin-bottom: 4px;">в т.ч. Судебная</label>
+                        <label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; display: block; margin-bottom: 4px;">Не включая судебную задолженность</label>
                         <input type="number" id="summarySiuatLegal" step="0.01" placeholder="Сумма" style="width: 100%; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); font-size: 13px;">
                     </div>
                 </div>
@@ -1640,6 +1703,28 @@
         </div>
     </div>
 
+    <!-- Модальное окно: настройка лимитов платежей -->
+    <div id="paymentLimitsSettingsModal" class="modal">
+        <div class="modal-content modal-large" style="max-width: 920px; max-height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header" style="flex-shrink: 0;">
+                <h3><i class="fas fa-sliders-h"></i> Настройка лимитов платежей</h3>
+                <span class="close-modal" id="closePaymentLimitsSettingsModal">&times;</span>
+            </div>
+            <div class="modal-body" style="flex: 1; overflow-y: auto;" id="plLimitsEditor"></div>
+            <div class="modal-footer" style="flex-shrink: 0; justify-content: space-between;">
+                <button id="plLimitsResetBtn" class="btn btn-secondary">
+                    <i class="fas fa-rotate-left"></i> Сбросить к значениям по умолчанию
+                </button>
+                <span style="display: flex; gap: 10px;">
+                    <button class="btn btn-secondary close-modal">Отмена</button>
+                    <button id="plLimitsSaveBtn" class="btn btn-success">
+                        <i class="fas fa-save"></i> Сохранить
+                    </button>
+                </span>
+            </div>
+        </div>
+    </div>
+
     <!-- Модальное окно: добавление/редактирование контрагента -->
     <div class="modal-overlay" id="contractorModal" style="display: none;">
         <div class="modal-content">
@@ -1697,6 +1782,7 @@
     <script src="debt-reconciliation.js"></script>
     <script src="contractors-library.js"></script>
     <script src="supplier-payments.js"></script>
+    <script src="payment-limits.js"></script>
     <script src="cashflow-allocator.js"></script>
     <script src="reports-manager.js"></script>
     <script src="settings-manager.js"></script>

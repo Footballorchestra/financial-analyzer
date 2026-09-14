@@ -362,6 +362,7 @@ def save_previous_day_data(swipe_date, filial_data, summary_dt=None, summary_siu
                 legal_siuat = EXCLUDED.legal_siuat,
                 not_recoverable_siuat = EXCLUDED.not_recoverable_siuat,
                 recoverable_siuat = EXCLUDED.recoverable_siuat
+            RETURNING id
         """, (
             swipe_date,
             total_overdue,
@@ -376,20 +377,28 @@ def save_previous_day_data(swipe_date, filial_data, summary_dt=None, summary_siu
             summary_siuat.get('recoverable', 0) if summary_siuat else 0
         ))
 
-        # Сохраняем данные по филиалам
+        swipe_row = cur.fetchone()
+        swipe_id = swipe_row[0] if swipe_row else None
+        if not swipe_id:
+            raise Exception("Не удалось получить ID записи swipe_history")
+
+        conn.commit()
+
+        # Сохраняем данные по филиалам (swipe_id обязателен для filial_snapshots)
         filial_rows = []
         for filial_name, overdue in filial_data.items():
             fixed_filial = fix_encoding(filial_name)
-            filial_rows.append((swipe_date, fixed_filial, float(overdue)))
+            filial_rows.append((swipe_id, swipe_date, fixed_filial, float(overdue), 0))
 
         if filial_rows:
             psycopg2.extras.execute_values(
                 cur,
                 """
-                INSERT INTO filial_snapshots (swipe_date, filial_name,
+                INSERT INTO filial_snapshots (swipe_id, swipe_date, filial_name,
                     overdue_amount, total_debt_amount)
                 VALUES %s
                 ON CONFLICT (swipe_date, filial_name) DO UPDATE SET
+                    swipe_id = EXCLUDED.swipe_id,
                     overdue_amount = EXCLUDED.overdue_amount,
                     total_debt_amount = EXCLUDED.total_debt_amount
                 """,
@@ -2089,6 +2098,398 @@ def sync_term_deposits(deposits):
     finally:
         if conn:
             return_connection(conn)
+
+# ============================================================
+# ФУНКЦИИ ДЛЯ КОНТРОЛЯ ЛИМИТОВ ПЛАТЕЖЕЙ ПОСТАВЩИКАМ
+# ============================================================
+
+_PLP_COLUMNS = [
+    'id', 'limit_month', 'period', 'confirmed_at', 'article', 'detail_limit',
+    'amount', 'recipient', 'request_no', 'request_date', 'status',
+    'organization', 'subdivision', 'priority', 'purpose', 'payment_date',
+    'applicant', 'payment_type'
+]
+
+_PLP_SCHEMA_APPLIED = False
+
+_PLP_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS payment_limits_payments (
+    id SERIAL PRIMARY KEY,
+    limit_month DATE NOT NULL,
+    period SMALLINT NOT NULL CHECK (period BETWEEN 1 AND 4),
+    confirmed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    article VARCHAR(255) NOT NULL,
+    detail_limit VARCHAR(255) DEFAULT '',
+    amount NUMERIC(20, 2) NOT NULL DEFAULT 0,
+    recipient VARCHAR(500) DEFAULT '',
+    request_no VARCHAR(255) DEFAULT '',
+    request_date DATE,
+    status VARCHAR(255) DEFAULT '',
+    organization VARCHAR(255) DEFAULT '',
+    subdivision VARCHAR(255) DEFAULT '',
+    priority VARCHAR(100) DEFAULT '',
+    purpose TEXT DEFAULT '',
+    payment_date DATE,
+    applicant VARCHAR(255) DEFAULT '',
+    payment_type VARCHAR(255) DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_plp_month_period ON payment_limits_payments(limit_month, period);
+CREATE INDEX IF NOT EXISTS idx_plp_article ON payment_limits_payments(article);
+"""
+
+# Настройки лимитов хранятся одной строкой (id = 1) в виде JSONB
+_PLP_CONFIG_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS payment_limits_config (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    config JSONB NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# Значения лимитов по умолчанию (рубли) — из технического задания
+DEFAULT_PAYMENT_LIMITS_CONFIG = {
+    "globalLimitP12": 31000000,
+    "categories": [
+        {
+            "id": "cat_aks",
+            "name": "Аренда, Коммуналка, Связь",
+            "limits": {"1": 6500000, "2": 1000000, "3": 7000000, "4": 0},
+            "details": [
+                {"id": "det_internet", "name": "Связь и интернет", "limits": {"1": 3500000, "2": 0, "3": 0, "4": 0}},
+                {"id": "det_utility", "name": "Коммунальные услуги", "limits": {"1": 1500000, "2": 1000000, "3": 0, "4": 0}},
+                {"id": "det_rent_flat", "name": "Аренда квартир", "limits": {"1": 1500000, "2": 0, "3": 0, "4": 0}},
+                {"id": "det_rent_office", "name": "Аренда баз и офисов", "limits": {"1": 0, "2": 0, "3": 7000000, "4": 0}},
+            ],
+        },
+        {
+            "id": "cat_life",
+            "name": "Жизнеобеспечение",
+            "limits": {"1": 6500000, "2": 5000000, "3": 7000000, "4": 7000000},
+            "details": [],
+        },
+        {
+            "id": "cat_fleet",
+            "name": "Автопарк",
+            "limits": {"1": 4500000, "2": 2500000, "3": 20000000, "4": 14000000},
+            "details": [],
+        },
+        {
+            "id": "cat_other",
+            "name": "Прочая операционка",
+            "limits": {"1": 1500000, "2": 1500000, "3": 10000000, "4": 10500000},
+            "details": [],
+        },
+        {
+            "id": "cat_overdue",
+            "name": "Графики просрочки",
+            "limits": {"1": 500000, "2": 500000, "3": 5000000, "4": 19000000},
+            "details": [],
+        },
+    ],
+}
+
+
+def _copy_default_plp_config():
+    """Возвращает глубокую копию конфигурации лимитов по умолчанию."""
+    return json.loads(json.dumps(DEFAULT_PAYMENT_LIMITS_CONFIG))
+
+
+def _ensure_plp_schema(conn):
+    """Одноразово (на процесс) создаёт таблицы контроля лимитов, если их нет."""
+    global _PLP_SCHEMA_APPLIED
+    if _PLP_SCHEMA_APPLIED:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT to_regclass('public.payment_limits_payments'), "
+            "to_regclass('public.payment_limits_config')"
+        )
+        payments_exists, config_exists = cur.fetchone()
+        if payments_exists is None:
+            cur.execute(_PLP_CREATE_SQL)
+            logger.info("Создана таблица payment_limits_payments (контроль лимитов платежей)")
+        if config_exists is None:
+            cur.execute(_PLP_CONFIG_CREATE_SQL)
+            logger.info("Создана таблица payment_limits_config (настройки лимитов платежей)")
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        logger.error(f"Не удалось проверить/создать таблицы контроля лимитов: {e}")
+        return
+    _PLP_SCHEMA_APPLIED = True
+
+
+def ensure_payment_limits_schema():
+    """Публичная обёртка: гарантирует наличие таблицы контроля лимитов платежей."""
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка ensure_payment_limits_schema: {e}")
+        return False
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_payment_limits_payments(month):
+    """
+    Возвращает подтверждённые платежи за указанный месяц учёта.
+
+    Args:
+        month: str/date — 'YYYY-MM' или 'YYYY-MM-01' (первый день месяца)
+
+    Returns:
+        list[dict] — строки таблицы payment_limits_payments за месяц
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        columns_sql = ', '.join(_PLP_COLUMNS)
+        cur.execute(
+            f"SELECT {columns_sql} FROM payment_limits_payments "
+            f"WHERE limit_month = %s ORDER BY period, confirmed_at, id",
+            (_PLP_MONTH(month),)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Ошибка получения платежей лимитов за {month}: {e}")
+        return []
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def _PLP_MONTH(month):
+    """Нормализует месяц ('YYYY-MM' или 'YYYY-MM-01') к DATE 'YYYY-MM-01'."""
+    s = str(month)
+    if len(s) == 7:
+        s = s + '-01'
+    return s
+
+
+def insert_payment_limits_payments(payments):
+    """
+    Вставляет подтверждённые платежи (пачка) в таблицу payment_limits_payments.
+
+    Args:
+        payments: list[dict] — подготовленные сервером строки:
+            {limit_month, period, article, detail_limit, amount, recipient,
+             request_no, request_date, status, organization, subdivision,
+             priority, purpose, payment_date, applicant, payment_type}
+
+    Returns:
+        dict — {'success': True, 'count': N} или {'success': False, 'error': '...'}
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+
+        rows = []
+        for p in payments:
+            rows.append((
+                _PLP_MONTH(p.get('limit_month')),
+                int(p.get('period', 0)),
+                p.get('article') or '',
+                p.get('detail_limit') or '',
+                p.get('amount') or 0,
+                p.get('recipient') or '',
+                p.get('request_no') or '',
+                p.get('request_date'),
+                p.get('status') or '',
+                p.get('organization') or '',
+                p.get('subdivision') or '',
+                p.get('priority') or '',
+                p.get('purpose') or '',
+                p.get('payment_date'),
+                p.get('applicant') or '',
+                p.get('payment_type') or ''
+            ))
+
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO payment_limits_payments
+                    (limit_month, period, article, detail_limit, amount,
+                     recipient, request_no, request_date, status,
+                     organization, subdivision, priority, purpose,
+                     payment_date, applicant, payment_type)
+                VALUES %s
+                """,
+                rows
+            )
+        conn.commit()
+        cur.close()
+
+        logger.info(f"Подтверждено платежей по лимитам: {len(rows)}")
+        return {'success': True, 'count': len(rows)}
+    except Exception as e:
+        logger.error(f"Ошибка сохранения платежей лимитов: {e}", exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {'success': False, 'error': str(e)}
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def cleanup_payment_limits_before(month):
+    """
+    Автоочистка: удаляет подтверждённые платежи за ВСЕ месяцы строго раньше
+    указанного (начало нового месяца — учёт начинается заново).
+
+    Args:
+        month: str/date — 'YYYY-MM' или 'YYYY-MM-01'
+
+    Returns:
+        int — количество удалённых строк
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM payment_limits_payments WHERE limit_month < %s",
+            (_PLP_MONTH(month),)
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        if deleted:
+            logger.info(f"Автоочистка лимитов платежей: удалено {deleted} строк до месяца {_PLP_MONTH(month)}")
+        return deleted
+    except Exception as e:
+        logger.error(f"Ошибка автоочистки лимитов платежей: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return 0
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_payment_limits_config():
+    """
+    Возвращает конфигурацию лимитов платежей (JSONB).
+    Если настройки ещё не сохранялись — значения по умолчанию.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT config FROM payment_limits_config WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+        if row and row[0]:
+            return row[0]
+        return _copy_default_plp_config()
+    except Exception as e:
+        logger.error(f"Ошибка получения настроек лимитов: {e}")
+        return _copy_default_plp_config()
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def _rename_payment_limits_data(cur, old_config, new_config):
+    """
+    Обновляет подтверждённые платежи при переименовании категорий/подстатей
+    (сопоставление старых и новых названий по id).
+    """
+    renames = []
+    if not old_config:
+        return renames
+    old_by_id = {c.get('id'): c for c in (old_config.get('categories') or [])}
+    for cat in (new_config.get('categories') or []):
+        old_cat = old_by_id.get(cat.get('id'))
+        if not old_cat:
+            continue
+        if old_cat.get('name') and cat.get('name') and old_cat['name'] != cat['name']:
+            cur.execute(
+                "UPDATE payment_limits_payments SET article = %s WHERE article = %s",
+                (cat['name'], old_cat['name'])
+            )
+            renames.append({'kind': 'category', 'from': old_cat['name'], 'to': cat['name'], 'rows': cur.rowcount})
+        old_details = {d.get('id'): d for d in (old_cat.get('details') or [])}
+        for det in (cat.get('details') or []):
+            old_det = old_details.get(det.get('id'))
+            if not old_det:
+                continue
+            if old_det.get('name') and det.get('name') and old_det['name'] != det['name']:
+                cur.execute(
+                    "UPDATE payment_limits_payments SET detail_limit = %s WHERE detail_limit = %s",
+                    (det['name'], old_det['name'])
+                )
+                renames.append({'kind': 'detail', 'from': old_det['name'], 'to': det['name'], 'rows': cur.rowcount})
+    return renames
+
+
+def save_payment_limits_config(config):
+    """
+    Сохраняет конфигурацию лимитов (одна строка id=1).
+    При переименовании категорий/подстатей обновляет уже подтверждённые платежи.
+
+    Returns:
+        dict — {'success': True, 'config': ..., 'renames': [...]}
+    """
+    conn = None
+    try:
+        if not isinstance(config, dict) or not isinstance(config.get('categories'), list):
+            return {'success': False, 'error': 'Некорректная структура настроек лимитов'}
+
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+
+        cur.execute("SELECT config FROM payment_limits_config WHERE id = 1")
+        row = cur.fetchone()
+        old_config = row[0] if row else None
+
+        cur.execute(
+            """
+            INSERT INTO payment_limits_config (id, config, updated_at)
+            VALUES (1, %s, NOW())
+            ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()
+            """,
+            (psycopg2.extras.Json(config),)
+        )
+
+        renames = _rename_payment_limits_data(cur, old_config, config)
+
+        conn.commit()
+        cur.close()
+        logger.info(f"Настройки лимитов платежей сохранены (переименований: {len(renames)})")
+        return {'success': True, 'config': config, 'renames': renames}
+    except Exception as e:
+        logger.error(f"Ошибка сохранения настроек лимитов: {e}", exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {'success': False, 'error': str(e)}
+    finally:
+        if conn:
+            return_connection(conn)
+
 
 def check_health():
     """

@@ -3116,3 +3116,548 @@ tr.recon-row-only_excel:hover {
     text-transform: uppercase;
     letter-spacing: 0.3px;
 }
+
+/* ============================================================
+   КОНТРОЛЬ ЛИМИТОВ ПЛАТЕЖЕЙ ПОСТАВЩИКАМ (payment-limits)
+   ============================================================ */
+.pl-header-info {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: flex-end;
+    font-size: 13px;
+}
+
+.pl-info-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-tertiary, #f1f5f9);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 8px;
+    padding: 6px 10px;
+    white-space: nowrap;
+}
+
+.pl-info-item i {
+    color: var(--accent, #2563eb);
+}
+
+.pl-upload-zone {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 4px 0 18px;
+    padding: 12px 14px;
+    background: var(--bg-tertiary, #f8fafc);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 10px;
+}
+
+.pl-empty-hint {
+    font-size: 13px;
+    color: var(--text-secondary, #64748b);
+}
+
+.pl-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+    margin-top: 16px;
+    padding: 16px;
+    background: var(--bg-tertiary, #f8fafc);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 10px;
+    position: sticky;
+    bottom: 12px;
+    z-index: 5;
+    box-shadow: 0 -2px 12px rgba(15, 23, 42, 0.06);
+}
+
+/* Сводные карточки */
+.pl-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.pl-summary-card {
+    background: var(--card-bg, #ffffff);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-left: 4px solid var(--accent, #2563eb);
+    border-radius: 10px;
+    padding: 14px 16px;
+}
+
+.pl-summary-blue { border-left-color: #2563eb; }
+.pl-summary-green { border-left-color: #16a34a; }
+.pl-summary-purple { border-left-color: #9333ea; }
+.pl-summary-orange { border-left-color: #f59e0b; }
+
+.pl-summary-label {
+    font-size: 12px;
+    color: var(--text-secondary, #64748b);
+    margin-bottom: 6px;
+}
+
+.pl-summary-value {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-primary, #0f172a);
+}
+
+/* Блоки */
+.pl-block {
+    background: var(--card-bg, #ffffff);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 20px;
+}
+
+.pl-block-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-primary, #0f172a);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.pl-block-title i {
+    color: var(--accent, #2563eb);
+}
+
+.pl-block-title small {
+    font-weight: 400;
+    color: var(--text-secondary, #64748b);
+    font-size: 12px;
+}
+
+/* Таблицы контроля */
+.pl-table-wrap {
+    overflow-x: auto;
+}
+
+.pl-table .number-cell,
+.pl-table th,
+.pl-table td {
+    font-size: 12px;
+}
+
+.pl-table thead th {
+    text-align: center;
+    min-width: 130px;
+}
+
+.pl-table thead th small {
+    display: block;
+    font-weight: 400;
+    color: var(--text-secondary, #64748b);
+    font-size: 10px;
+}
+
+.pl-article-name {
+    font-weight: 500;
+    min-width: 200px;
+}
+
+.pl-month-total {
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.pl-grand-row td {
+    background: var(--bg-tertiary, #f8fafc);
+    border-top: 2px solid var(--border-medium, #e2e8f0);
+    font-size: 13px;
+}
+
+.pl-unmatched td {
+    background: rgba(245, 158, 11, 0.06);
+    color: var(--text-secondary, #64748b);
+    font-style: italic;
+}
+
+.pl-cell-td {
+    vertical-align: top;
+    padding: 8px 10px !important;
+}
+
+.pl-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.pl-cell-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    line-height: 1.3;
+}
+
+.pl-line {
+    font-size: 11px;
+    color: var(--text-secondary, #475569);
+    white-space: nowrap;
+}
+
+.pl-line b {
+    color: var(--text-primary, #0f172a);
+}
+
+.pl-line-total b {
+    font-size: 12px;
+}
+
+.pl-current-period {
+    color: var(--accent, #2563eb);
+    font-size: 11px;
+}
+
+/* Прогресс-бары лимитов */
+.limit-bar {
+    height: 8px;
+    background: var(--bg-tertiary, #e2e8f0);
+    border-radius: 999px;
+    overflow: hidden;
+    min-width: 100px;
+}
+
+.limit-bar-lg {
+    height: 14px;
+}
+
+.limit-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.4s ease;
+}
+
+.limit-bar-fill.limit-ok { background: #16a34a; }
+.limit-bar-fill.limit-warn { background: #f59e0b; }
+.limit-bar-fill.limit-over { background: #dc2626; }
+
+.pl-pct {
+    font-size: 11px;
+    color: var(--text-secondary, #475569);
+    white-space: nowrap;
+}
+
+.pl-pct-limit-warn { color: #b45309; font-weight: 600; }
+.pl-pct-limit-over { color: #dc2626; font-weight: 700; }
+
+/* Глобальный лимит P1+P2 */
+.pl-global-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.pl-global-value {
+    background: var(--bg-tertiary, #f8fafc);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
+.pl-global-value .pl-summary-value {
+    font-size: 16px;
+}
+
+.pl-text-over { color: #dc2626 !important; font-weight: 700; }
+.pl-text-ok { color: #16a34a !important; font-weight: 700; }
+
+/* Таблица заявок превью */
+.pl-requests-table {
+    min-width: 1600px;
+}
+
+.pl-requests-table td {
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.pl-requests-table .row-needs-review td:first-child {
+    border-left: 3px solid var(--warning, #f59e0b);
+}
+
+/* Мобильная адаптация */
+@media (max-width: 768px) {
+    .pl-header-info {
+        justify-content: flex-start;
+        margin-top: 8px;
+    }
+
+    .pl-actions {
+        position: static;
+        flex-direction: column;
+    }
+
+    .pl-actions .btn {
+        width: 100%;
+    }
+}
+
+/* ============================================================
+   ДОПОЛНИТЕЛЬНЫЕ СТИЛИ КОНТРОЛЯ ЛИМИТОВ (компактный вид)
+   ============================================================ */
+.pl-block-flat {
+    padding: 12px 14px;
+    margin-bottom: 12px;
+}
+
+.pl-block-title {
+    margin-bottom: 8px;
+}
+
+.pl-amounts {
+    font-size: 13px;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.pl-amounts b {
+    font-weight: 700;
+}
+
+.pl-of {
+    font-size: 11px;
+    color: var(--text-secondary, #64748b);
+    font-weight: 400;
+}
+
+.pl-meta {
+    font-size: 10px;
+    color: var(--text-secondary, #64748b);
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.pl-bar-cell {
+    min-width: 170px;
+}
+
+.pl-bar-cell .limit-bar {
+    margin-bottom: 2px;
+}
+
+.pl-warn-label {
+    font-weight: 400;
+    color: var(--text-secondary, #64748b);
+    font-size: 10px;
+}
+
+.pl-table-narrow td {
+    font-size: 12px;
+}
+
+.pl-table-narrow .number-cell {
+    white-space: nowrap;
+}
+
+.pl-global-row-tr td {
+    background: rgba(37, 99, 235, 0.04);
+    border-top: 1px dashed var(--border-medium, #e2e8f0);
+    font-size: 12px;
+}
+
+.pl-current-period {
+    font-size: 10px;
+}
+
+/* ============================================================
+   РЕДАКТОР НАСТРОЕК ЛИМИТОВ ПЛАТЕЖЕЙ
+   ============================================================ */
+.pl-editor-hint {
+    font-size: 12px;
+    color: var(--text-secondary, #64748b);
+    margin-bottom: 16px;
+    line-height: 1.5;
+}
+
+.pl-editor-section {
+    margin-bottom: 22px;
+}
+
+.pl-editor-section h4 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary, #0f172a);
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.pl-editor-section h4 i {
+    color: var(--primary, #2563eb);
+}
+
+.pl-editor-table td {
+    padding: 6px 8px;
+}
+
+.pl-editor-table thead th {
+    text-align: center;
+    font-size: 12px;
+}
+
+.pl-editor-input {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--text-primary, #0f172a);
+    background: var(--bg-card, #ffffff);
+}
+
+.pl-editor-input:focus {
+    outline: none;
+    border-color: var(--primary, #2563eb);
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.pl-editor-number {
+    text-align: right;
+    min-width: 130px;
+}
+
+.pl-editor-table input[type="text"] {
+    min-width: 230px;
+}
+
+.pl-editor-global {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.pl-editor-global label {
+    font-size: 12px;
+    color: var(--text-secondary, #64748b);
+}
+
+.pl-editor-global input {
+    width: 220px;
+}
+
+/* Переключатель режима «Только текущий период» (лимиты платежей) */
+.pl-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-secondary, #475569);
+    background: var(--bg-tertiary, #f8fafc);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 8px;
+    padding: 6px 12px;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    transition: border-color 0.15s ease;
+}
+
+.pl-switch:hover {
+    border-color: var(--primary, #2563eb);
+}
+
+.pl-switch input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    accent-color: var(--primary, #2563eb);
+    margin: 0;
+}
+
+/* Селект выбора периода загрузки (лимиты платежей) */
+.pl-period-select {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-secondary, #475569);
+    white-space: nowrap;
+}
+
+.pl-period-select select {
+    padding: 6px 10px;
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 8px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg-card, #ffffff);
+    color: var(--text-primary, #0f172a);
+    cursor: pointer;
+}
+
+.pl-period-select select:focus {
+    outline: none;
+    border-color: var(--primary, #2563eb);
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+/* Кликабельные категории/подстатьи и фильтр списка заявок (лимиты) */
+.pl-cat-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: var(--primary, #2563eb);
+    cursor: pointer;
+    text-align: left;
+    text-decoration: none;
+}
+
+.pl-cat-link:hover {
+    text-decoration: underline;
+}
+
+.pl-filter-row td {
+    background: rgba(37, 99, 235, 0.06) !important;
+}
+
+.pl-filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 8px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--primary, #2563eb);
+    background: rgba(37, 99, 235, 0.1);
+    border-radius: 999px;
+    padding: 3px 8px;
+}
+
+.pl-filter-reset {
+    border: none;
+    background: none;
+    cursor: pointer;
+    color: inherit;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0;
+}
+
+.pl-filter-reset:hover {
+    color: #dc2626;
+}
+
+.pl-empty-filter {
+    text-align: center;
+    color: var(--text-secondary, #64748b);
+    font-style: italic;
+    padding: 16px;
+}

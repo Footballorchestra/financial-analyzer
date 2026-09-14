@@ -46,7 +46,16 @@ class StorageManager {
     // Управление счетами
     setAccounts(accounts) { this.accounts = accounts; }
     getAccounts() { return { ...this.accounts }; }
-    updateAccount(account, data) { this.accounts[account] = { ...this.accounts[account], ...data }; }
+    updateAccount(account, data) {
+        // Merge: не затираем уже известные значения (например, остаток из выписки)
+        // пустыми значениями из нового прохода парсера.
+        const merged = { ...(this.accounts[account] || {}) };
+        Object.entries(data || {}).forEach(([key, value]) => {
+            if (value === undefined || value === null || value === '') return;
+            merged[key] = value;
+        });
+        this.accounts[account] = merged;
+    }
 
     // Управление ИНН
     setINNData(data) { this.innData = data; }
@@ -183,7 +192,16 @@ class StorageManager {
             const resp = await fetch('/api/config');
             const cfg = await resp.json();
             if (cfg.success) {
-                this.accounts = cfg.data.account_mapping || {};
+                const mapping = cfg.data.account_mapping || {};
+                // ВАЖНО: не перезаписываем счета целиком, а сливаем маппинг с уже известными
+                // данными (из выписок: balance, date). Иначе поздний ответ /api/config
+                // затирает остатки, загруженные при обработке выписок, и в разделе
+                // «Остатки» пропадают данные по счетам.
+                const merged = { ...this.accounts };
+                Object.entries(mapping).forEach(([account, data]) => {
+                    merged[account] = { ...(merged[account] || {}), ...(data || {}) };
+                });
+                this.accounts = merged;
                 this.exclusionRules = cfg.data.exclusion_rules || [];
                 this.categorizationRules = cfg.data.categorization_rules || [];
                 this.companyAliases = cfg.data.company_aliases || [];
