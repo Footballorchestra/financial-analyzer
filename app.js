@@ -1733,6 +1733,16 @@ class App {
             });
         }
 
+        // Сохранение стадий: черновик (стадия 1) и финальный вариант (стадия 2)
+        const draftBtn = document.getElementById('saveDraftPaymentLimitsBtn');
+        if (draftBtn) {
+            draftBtn.addEventListener('click', () => this.handlePaymentLimitsSave('draft'));
+        }
+        const finalBtn = document.getElementById('saveFinalPaymentLimitsBtn');
+        if (finalBtn) {
+            finalBtn.addEventListener('click', () => this.handlePaymentLimitsSave('final'));
+        }
+
         const cancelBtn = document.getElementById('cancelPaymentLimitsBtn');
         if (cancelBtn) {
             cancelBtn.addEventListener('click', () => {
@@ -1782,10 +1792,49 @@ class App {
             });
         }
 
-        // Клик по категории/подстатье — фильтрация списка загруженных заявок
+        // Горизонтальное меню блоков (радио-вкладки: активной всегда ровно одна)
+        const tabsBar = document.getElementById('plTabs');
+        if (tabsBar) {
+            tabsBar.querySelectorAll('input[name="plTabs"]').forEach(radio => {
+                radio.addEventListener('change', () => {
+                    if (!radio.checked) return;
+                    this.paymentLimits.setActiveTab(radio.value);
+                    this.renderPaymentLimitsUI();
+                    // Если блок оказался выше экрана — поднимаем его в поле зрения
+                    const area = document.getElementById('plControlArea');
+                    if (area && area.getBoundingClientRect().top < 0) {
+                        area.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                });
+            });
+        }
+
+        // Клик по категории/подстатье/группе — фильтрация списка загруженных заявок
         const plControlArea = document.getElementById('plControlArea');
         if (plControlArea) {
             plControlArea.addEventListener('click', (e) => this.handlePaymentLimitsControlClick(e));
+            // Отметка/снятие заявок чекбоксами — пересчёт итогов во всех блоках
+            plControlArea.addEventListener('change', (e) => this.handlePaymentLimitsRowCheck(e));
+            // Enter в поле пояснения — сохраняем сразу
+            plControlArea.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && e.target && e.target.hasAttribute
+                    && e.target.hasAttribute('data-pl-expl')) {
+                    e.preventDefault();
+                    e.target.blur();
+                }
+            });
+        }
+
+        // Экспорт реестра в исходном формате (без снятых заявок)
+        const exportBtn = document.getElementById('exportPaymentLimitsBtn');
+        if (exportBtn) {
+            exportBtn.addEventListener('click', () => this.handlePaymentLimitsExport());
+        }
+
+        // Обнуление ранее загруженных данных месяца (для повторного прохождения цикла)
+        const resetBtn = document.getElementById('resetPaymentLimitsBtn');
+        if (resetBtn) {
+            resetBtn.addEventListener('click', () => this.handlePaymentLimitsReset());
         }
 
         document.querySelectorAll('#paymentLimitsSettingsModal .close-modal').forEach(btn => {
@@ -1795,14 +1844,73 @@ class App {
         });
     }
 
-    // Фильтрация списка заявок по клику на категорию/подстатью
+    // Фильтрация списка заявок по клику на категорию/подстатью/группу
     handlePaymentLimitsControlClick(e) {
         const manager = this.paymentLimits;
 
         const resetBtn = e.target.closest('[data-pl-filter-reset]');
         if (resetBtn) {
-            manager.setPreviewFilter(null, null);
+            manager.setPreviewFilter(null, null, null);
             this.renderPaymentLimitsUI();
+            return;
+        }
+
+        // «Выбрать все» / «Снять все» заявки
+        const selectBtn = e.target.closest('[data-pl-select]');
+        if (selectBtn) {
+            e.preventDefault();
+            if (!manager.previewRows.length) return;
+            const selectAll = selectBtn.getAttribute('data-pl-select') === 'all';
+            manager.setAllSelected(selectAll);
+            this.renderPaymentLimitsUI();
+            this.showNotification(selectAll
+                ? `Отмечены все заявки: ${manager.selectedCount()}, сумма ${manager.fmtMoney(manager.selectedTotal())} ₽`
+                : 'Все заявки сняты — итоги по блокам обнулены', 'info');
+            return;
+        }
+
+        // Клик по группе в блоке «Разбивка на категории»
+        const groupLink = e.target.closest('[data-pl-group]');
+        if (groupLink) {
+            e.preventDefault();
+            if (!manager.previewRows.length) {
+                this.showNotification('Загрузите реестр — список заявок пуст', 'info');
+                return;
+            }
+            manager.setPreviewFilter(null, null, groupLink.getAttribute('data-pl-group'));
+            this.renderPaymentLimitsUI();
+            const blockG = document.getElementById('plPreviewListBlock');
+            if (blockG) blockG.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            return;
+        }
+
+        // Клик по подразделению в блоке «Пояснения» — фильтр списка заявок
+        const subdivisionLink = e.target.closest('[data-pl-subdivision]');
+        if (subdivisionLink) {
+            e.preventDefault();
+            if (!manager.previewRows.length) {
+                this.showNotification('Загрузите реестр — список заявок пуст', 'info');
+                return;
+            }
+            manager.setPreviewFilter(null, null, null, subdivisionLink.getAttribute('data-pl-subdivision'), null);
+            this.renderPaymentLimitsUI();
+            const blockS = document.getElementById('plPreviewListBlock');
+            if (blockS) blockS.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            return;
+        }
+
+        // Клик по контрагенту в блоке «Пояснения» — фильтр списка заявок
+        const recipientLink = e.target.closest('[data-pl-recipient]');
+        if (recipientLink) {
+            e.preventDefault();
+            if (!manager.previewRows.length) {
+                this.showNotification('Загрузите реестр — список заявок пуст', 'info');
+                return;
+            }
+            manager.setPreviewFilter(null, null, null, null, recipientLink.getAttribute('data-pl-recipient'));
+            this.renderPaymentLimitsUI();
+            const blockR = document.getElementById('plPreviewListBlock');
+            if (blockR) blockR.scrollIntoView({ behavior: 'smooth', block: 'start' });
             return;
         }
 
@@ -1817,13 +1925,107 @@ class App {
 
         manager.setPreviewFilter(
             link.getAttribute('data-pl-category'),
-            link.getAttribute('data-pl-detail')
+            link.getAttribute('data-pl-detail'),
+            null
         );
         this.renderPaymentLimitsUI();
 
         // Прокручиваем к отфильтрованному списку заявок
         const block = document.getElementById('plPreviewListBlock');
         if (block) block.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    // Отметка/снятие заявки чекбоксом — итоги во всех блоках пересчитываются.
+    // Поддерживает: отдельную заявку, всю категорию/подстатью/группу и все заявки в списке.
+    handlePaymentLimitsRowCheck(e) {
+        const input = e.target;
+        if (!input || input.tagName !== 'INPUT') return;
+        const manager = this.paymentLimits;
+
+        // Правка пояснения прямо в сводной таблице блока «Пояснения»
+        if (input.hasAttribute && input.hasAttribute('data-pl-expl')) {
+            this.handlePaymentLimitsExplanation(input);
+            return;
+        }
+
+        // Кнопки-категории внутри блока «Пояснения»: перестраивают сводную
+        // и одновременно фильтруют список заявок ниже
+        if (input.type === 'radio' && input.name === 'plExpGroup') {
+            if (!input.checked) return;
+            manager.setExplanationGroup(input.value);
+            manager.setPreviewFilter(null, null, input.value);
+            this.renderPaymentLimitsUI();
+            return;
+        }
+
+        if (input.type !== 'checkbox') return;
+        let changed = 0;
+
+        if (input.hasAttribute('data-pl-select-toggle')) {
+            changed = manager.setRowsSelected(manager.filteredPreviewRows(), input.checked);
+        } else if (input.hasAttribute('data-pl-cat-toggle')) {
+            changed = manager.setRowsSelected(manager.rowsByCategory(input.getAttribute('data-pl-cat-toggle')), input.checked);
+        } else if (input.hasAttribute('data-pl-detail-toggle')) {
+            changed = manager.setRowsSelected(
+                manager.rowsByDetail(input.getAttribute('data-pl-cat'), input.getAttribute('data-pl-detail-toggle')),
+                input.checked);
+        } else if (input.hasAttribute('data-pl-group-toggle')) {
+            changed = manager.setRowsSelected(manager.rowsByGroup(input.getAttribute('data-pl-group-toggle')), input.checked);
+        } else if (input.hasAttribute('data-pl-row')) {
+            if (!manager.setRowSelected(input.getAttribute('data-pl-row'), input.checked)) return;
+            changed = 1;
+        } else {
+            return;
+        }
+
+        if (changed) this.renderPaymentLimitsUI();
+    }
+
+    // Сохранение пояснения из сводной таблицы → сразу в «Библиотеку контрагентов»
+    async handlePaymentLimitsExplanation(input) {
+        const manager = this.paymentLimits;
+        const contractor = input.getAttribute('data-pl-expl');
+        const previous = manager.explanationFor(contractor);
+        const value = String(input.value || '').trim();
+        if (value === previous) return;
+
+        try {
+            const result = await manager.saveExplanation(contractor, value);
+            if (result.success) {
+                input.classList.toggle('pl-exp-missing', !value);
+                input.classList.add('pl-exp-saved');
+                setTimeout(() => input.classList.remove('pl-exp-saved'), 1500);
+                this.showNotification(result.message, 'success');
+            } else {
+                input.value = previous;
+                input.classList.toggle('pl-exp-missing', !previous);
+                this.showNotification(result.message || 'Не удалось сохранить пояснение', 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка сохранения пояснения:', error);
+            input.value = previous;
+            this.showNotification('Ошибка сохранения пояснения', 'error');
+        }
+    }
+
+    // Экспорт реестра заявок в исходном формате (только отмеченные)
+    async handlePaymentLimitsExport() {
+        const manager = this.paymentLimits;
+        this.showLoading();
+        try {
+            const result = await manager.exportToExcel();
+            if (result.success) {
+                this.renderPaymentLimitsUI();   // обновляем кружок-уведомление на кнопке
+                this.showNotification(result.message, result.warning ? 'info' : 'success');
+            } else {
+                this.showNotification(result.message || 'Ошибка экспорта', 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка экспорта реестра лимитов:', error);
+            this.showNotification('Ошибка экспорта', 'error');
+        } finally {
+            this.hideLoading();
+        }
     }
 
     // Открытие/сохранение настроек лимитов
@@ -1885,6 +2087,27 @@ class App {
                 console.warn('Не удалось загрузить подтверждённые платежи:', res.message);
             }
         }
+
+        // Справочник контрагентов (пояснения) для блока «Пояснения»
+        const libRes = await manager.loadContractorsLibrary();
+        if (!libRes.success) {
+            console.warn('Библиотека контрагентов недоступна:', libRes.message);
+        }
+
+        // Сохранённый вариант месяца (черновик/финал) — подгружается автоматически,
+        // чтобы коллега на другом компьютере сразу видел данные
+        const stateRes = await manager.loadRegistryState();
+        if (stateRes.success && stateRes.registry) {
+            if (!manager.previewRows.length) {
+                const loaded = await manager.loadRegistryPreview();
+                if (loaded.success) {
+                    this.showNotification(loaded.message, 'info');
+                } else if (loaded.message && !/не найден/.test(loaded.message)) {
+                    console.warn('Автозагрузка реестра лимитов:', loaded.message);
+                }
+            }
+        }
+
         this.renderPaymentLimitsUI();
     }
 
@@ -1903,14 +2126,48 @@ class App {
 
         const actions = document.getElementById('plActions');
         const hint = document.getElementById('plEmptyHint');
+
+        // Кнопка экспорта доступна только при загруженном реестре
+        const exportBtn = document.getElementById('exportPaymentLimitsBtn');
+        if (exportBtn) exportBtn.disabled = manager.previewRows.length === 0 && !(manager.registry && manager.registry.has_file);
+
+        // Красный кружок на кнопке экспорта: финальный вариант согласован и ещё не выгружен
+        const exportBadge = document.getElementById('exportPaymentLimitsBadge');
+        if (exportBadge) exportBadge.hidden = !manager.finalExportPending();
+
+        // Стадия 1 (черновик) и стадия 2 (финал): сохраняем только отмеченные заявки
+        const draftSaveBtn = document.getElementById('saveDraftPaymentLimitsBtn');
+        if (draftSaveBtn) draftSaveBtn.disabled = manager.previewRows.length === 0;
+        const finalSaveBtn = document.getElementById('saveFinalPaymentLimitsBtn');
+        if (finalSaveBtn) finalSaveBtn.disabled = manager.previewRows.length === 0 || manager.selectedCount() === 0;
+
+        // Состояние сохранённого варианта месяца
+        const registryState = document.getElementById('plRegistryState');
+        if (registryState) registryState.textContent = manager.registryStatusText();
+
         if (actions) {
             actions.style.display = manager.previewRows.length > 0 ? 'flex' : 'none';
         }
+
+        // Подпись слева в закреплённой полосе кнопок
+        const actionsInfo = document.getElementById('plActionsInfo');
+        if (actionsInfo) {
+            actionsInfo.textContent = manager.previewRows.length
+                ? `Отмечено: ${manager.selectedCount()} из ${manager.previewRows.length} · `
+                  + `${manager.fmtMoney(manager.selectedTotal())} ₽ · ${manager.registryStatusText()}`
+                : '';
+        }
         if (hint) {
             if (manager.previewRows.length > 0) {
-                hint.textContent = `Период загрузки: ${manager.periodLabel(manager.currentPeriod)} — файл будет подтверждён с этим периодом`;
+                const stage = manager.savedStage();
+                const stageText = stage === 'final' ? 'открыт сохранённый финальный вариант'
+                    : (stage === 'draft' ? 'открыт сохранённый черновик' : 'данные не сохранены');
+                hint.textContent = `Период загрузки: ${manager.periodLabel(manager.currentPeriod)} · ${stageText}. `
+                    + `Отмечено заявок: ${manager.selectedCount()} из ${manager.previewRows.length} `
+                    + `(${manager.fmtMoney(manager.selectedTotal())} ₽)`;
             } else {
-                hint.textContent = `Загрузите Excel-реестр. Уже подтверждено за месяц: ${manager.confirmedRows.length} платежей.`;
+                hint.textContent = `Загрузите Excel-реестр или дождитесь автозагрузки сохранённого варианта. `
+                    + `Сохранено за месяц: ${manager.confirmedRows.length} платежей.`;
             }
             hint.style.color = 'var(--text-secondary)';
         }
@@ -1926,6 +2183,13 @@ class App {
                 if (!manager.confirmedLoaded) {
                     await manager.loadConfirmed(manager.currentMonth);
                 }
+                // Обновляем состояние сохранённого варианта месяца
+                await manager.loadRegistryState();
+                // Если загружен тот же файл, что уже сохранён за месяц, — не суммируем его с БД
+                if (manager.adoptRegistryIfSameFile(file)) {
+                    this.showNotification('Это тот же файл, что уже сохранён за месяц: '
+                        + 'применены сохранённые отметки, данные не суммируются', 'info');
+                }
                 this.renderPaymentLimitsUI();
                 this.showNotification(result.message + '. Период загрузки: ' + manager.periodLabel(manager.currentPeriod), 'success');
             } else {
@@ -1939,27 +2203,59 @@ class App {
         }
     }
 
-    async handlePaymentLimitsConfirm() {
+    // Сохранение стадии: 'draft' — черновик (стадия 1), 'final' — финальный вариант (стадия 2)
+    async handlePaymentLimitsSave(stage) {
         const manager = this.paymentLimits;
         if (!manager.previewRows.length) return;
         this.showLoading();
         try {
-            const result = await manager.confirmSave();
+            const result = await manager.saveStage(stage);
             if (result.success) {
-                manager.cancelPreview();
-                // Перечитываем подтверждённые данные месяца
+                // После сохранения перечитываем сохранённый вариант (для накопительных итогов)
                 await manager.loadConfirmed(manager.currentMonth);
                 this.renderPaymentLimitsUI();
-                this.showNotification(result.message || 'Платежи подтверждены и сохранены в БД', 'success');
+                this.showNotification(result.message, 'success');
             } else {
-                this.showNotification(result.message || 'Ошибка подтверждения', 'error');
+                this.showNotification(result.message || 'Ошибка сохранения', 'error');
             }
         } catch (error) {
-            console.error('Ошибка подтверждения:', error);
-            this.showNotification('Ошибка при подтверждении', 'error');
+            console.error('Ошибка сохранения варианта лимитов:', error);
+            this.showNotification('Ошибка сохранения', 'error');
         } finally {
             this.hideLoading();
         }
+    }
+
+    // Обнуление ранее загруженных данных месяца (чтобы пройти полный цикл заново)
+    async handlePaymentLimitsReset() {
+        const manager = this.paymentLimits;
+        const confirmed = window.confirm(
+            'Обнулить ранее загруженные данные за текущий месяц?\n\n'
+            + 'Будут удалены: сохранённый черновик, финальный вариант, платежи и исходный файл реестра. '
+            + 'После этого можно снова загрузить файл и пройти обе стадии согласования.');
+        if (!confirmed) return;
+
+        this.showLoading();
+        try {
+            const result = await manager.resetSavedData();
+            if (result.success) {
+                await manager.loadConfirmed();
+                this.renderPaymentLimitsUI();
+                this.showNotification(result.message, 'success');
+            } else {
+                this.showNotification(result.message || 'Ошибка обнуления', 'error');
+            }
+        } catch (error) {
+            console.error('Ошибка обнуления данных лимитов:', error);
+            this.showNotification('Ошибка обнуления', 'error');
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    // Совместимость: старое «Подтвердить и сохранить» = финальный вариант (стадия 2)
+    handlePaymentLimitsConfirm() {
+        return this.handlePaymentLimitsSave('final');
     }
 
     handlePaymentLimitsCancel() {

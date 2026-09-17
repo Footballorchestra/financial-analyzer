@@ -2104,11 +2104,15 @@ def sync_term_deposits(deposits):
 # ============================================================
 
 _PLP_COLUMNS = [
-    'id', 'limit_month', 'period', 'confirmed_at', 'article', 'detail_limit',
+    'id', 'limit_month', 'period', 'stage', 'confirmed_at', 'article', 'detail_limit',
     'amount', 'recipient', 'request_no', 'request_date', 'status',
     'organization', 'subdivision', 'priority', 'purpose', 'payment_date',
     'applicant', 'payment_type'
 ]
+
+# Стадии подтверждения: черновик (первичное сохранение) и финальный вариант
+PLP_STAGE_DRAFT = 'draft'
+PLP_STAGE_FINAL = 'final'
 
 _PLP_SCHEMA_APPLIED = False
 
@@ -2117,6 +2121,7 @@ CREATE TABLE IF NOT EXISTS payment_limits_payments (
     id SERIAL PRIMARY KEY,
     limit_month DATE NOT NULL,
     period SMALLINT NOT NULL CHECK (period BETWEEN 1 AND 4),
+    stage VARCHAR(10) NOT NULL DEFAULT 'final',
     confirmed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     article VARCHAR(255) NOT NULL,
     detail_limit VARCHAR(255) DEFAULT '',
@@ -2135,6 +2140,31 @@ CREATE TABLE IF NOT EXISTS payment_limits_payments (
 );
 CREATE INDEX IF NOT EXISTS idx_plp_month_period ON payment_limits_payments(limit_month, period);
 CREATE INDEX IF NOT EXISTS idx_plp_article ON payment_limits_payments(article);
+CREATE INDEX IF NOT EXISTS idx_plp_stage ON payment_limits_payments(limit_month, period, stage);
+"""
+
+# Реестр загрузки: исходный файл + снятые чекбоксами строки для каждой стадии.
+# Нужен, чтобы финальный файл можно было выгрузить с любого компьютера и после перезапуска.
+_PLP_REGISTRY_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS payment_limits_registry (
+    id SERIAL PRIMARY KEY,
+    limit_month DATE NOT NULL,
+    period SMALLINT NOT NULL CHECK (period BETWEEN 1 AND 4),
+    file_name VARCHAR(500) DEFAULT '',
+    sheet_name VARCHAR(255) DEFAULT '',
+    file_bytes BYTEA,
+    row_count INTEGER DEFAULT 0,
+    draft_removed_rows JSONB DEFAULT '[]'::jsonb,
+    draft_saved_at TIMESTAMP,
+    draft_author VARCHAR(255) DEFAULT '',
+    final_removed_rows JSONB DEFAULT '[]'::jsonb,
+    final_saved_at TIMESTAMP,
+    final_author VARCHAR(255) DEFAULT '',
+    final_exported_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (limit_month, period)
+);
 """
 
 # Настройки лимитов хранятся одной строкой (id = 1) в виде JSONB
@@ -2195,7 +2225,7 @@ def _copy_default_plp_config():
 
 
 def _ensure_plp_schema(conn):
-    """Одноразово (на процесс) создаёт таблицы контроля лимитов, если их нет."""
+    """Одноразово (на процесс) создаёт таблицы контроля лимитов и доводит схему до актуальной."""
     global _PLP_SCHEMA_APPLIED
     if _PLP_SCHEMA_APPLIED:
         return
@@ -2203,15 +2233,35 @@ def _ensure_plp_schema(conn):
         cur = conn.cursor()
         cur.execute(
             "SELECT to_regclass('public.payment_limits_payments'), "
-            "to_regclass('public.payment_limits_config')"
+            "to_regclass('public.payment_limits_config'), "
+            "to_regclass('public.payment_limits_registry')"
         )
-        payments_exists, config_exists = cur.fetchone()
+        payments_exists, config_exists, registry_exists = cur.fetchone()
         if payments_exists is None:
             cur.execute(_PLP_CREATE_SQL)
             logger.info("Создана таблица payment_limits_payments (контроль лимитов платежей)")
+        else:
+            # Стадия подтверждения: черновик / финальный вариант
+            cur.execute(
+                "ALTER TABLE payment_limits_payments "
+                "ADD COLUMN IF NOT EXISTS stage VARCHAR(10) NOT NULL DEFAULT 'final'"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plp_stage "
+                "ON payment_limits_payments(limit_month, period, stage)"
+            )
         if config_exists is None:
             cur.execute(_PLP_CONFIG_CREATE_SQL)
             logger.info("Создана таблица payment_limits_config (настройки лимитов платежей)")
+        if registry_exists is None:
+            cur.execute(_PLP_REGISTRY_CREATE_SQL)
+            logger.info("Создана таблица payment_limits_registry (реестр загрузок лимитов)")
+        else:
+            # Отметка о выгрузке финального файла (для уведомления на кнопке экспорта)
+            cur.execute(
+                "ALTER TABLE payment_limits_registry "
+                "ADD COLUMN IF NOT EXISTS final_exported_at TIMESTAMP"
+            )
         conn.commit()
         cur.close()
     except Exception as e:
@@ -2235,15 +2285,16 @@ def ensure_payment_limits_schema():
             return_connection(conn)
 
 
-def get_payment_limits_payments(month):
+def get_payment_limits_payments(month, stage=None):
     """
-    Возвращает подтверждённые платежи за указанный месяц учёта.
+    Возвращает платежи лимитов за указанный месяц учёта.
 
     Args:
         month: str/date — 'YYYY-MM' или 'YYYY-MM-01' (первый день месяца)
+        stage: 'draft' | 'final' | None — фильтр по стадии подтверждения
 
     Returns:
-        list[dict] — строки таблицы payment_limits_payments за месяц
+        list[dict] — строки таблицы payment_limits_payments за месяц (поле stage включено)
     """
     conn = None
     try:
@@ -2251,11 +2302,18 @@ def get_payment_limits_payments(month):
         _ensure_plp_schema(conn)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         columns_sql = ', '.join(_PLP_COLUMNS)
-        cur.execute(
-            f"SELECT {columns_sql} FROM payment_limits_payments "
-            f"WHERE limit_month = %s ORDER BY period, confirmed_at, id",
-            (_PLP_MONTH(month),)
-        )
+        if stage:
+            cur.execute(
+                f"SELECT {columns_sql} FROM payment_limits_payments "
+                f"WHERE limit_month = %s AND stage = %s ORDER BY period, confirmed_at, id",
+                (_PLP_MONTH(month), stage)
+            )
+        else:
+            cur.execute(
+                f"SELECT {columns_sql} FROM payment_limits_payments "
+                f"WHERE limit_month = %s ORDER BY period, confirmed_at, id",
+                (_PLP_MONTH(month),)
+            )
         rows = cur.fetchall()
         cur.close()
         return [dict(r) for r in rows]
@@ -2299,6 +2357,7 @@ def insert_payment_limits_payments(payments):
             rows.append((
                 _PLP_MONTH(p.get('limit_month')),
                 int(p.get('period', 0)),
+                p.get('stage') or PLP_STAGE_FINAL,
                 p.get('article') or '',
                 p.get('detail_limit') or '',
                 p.get('amount') or 0,
@@ -2320,7 +2379,7 @@ def insert_payment_limits_payments(payments):
                 cur,
                 """
                 INSERT INTO payment_limits_payments
-                    (limit_month, period, article, detail_limit, amount,
+                    (limit_month, period, stage, article, detail_limit, amount,
                      recipient, request_no, request_date, status,
                      organization, subdivision, priority, purpose,
                      payment_date, applicant, payment_type)
@@ -2335,6 +2394,356 @@ def insert_payment_limits_payments(payments):
         return {'success': True, 'count': len(rows)}
     except Exception as e:
         logger.error(f"Ошибка сохранения платежей лимитов: {e}", exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {'success': False, 'error': str(e)}
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def save_payment_limits_stage(month, period, stage, payments):
+    """
+    Сохраняет вариант (черновик/финал) за месяц + период: заменяет прежний вариант этой стадии.
+
+    Returns:
+        dict — {'success': True, 'count': N, 'replaced': M} или {'success': False, 'error': '...'}
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        month_val = _PLP_MONTH(month)
+        period_val = int(period)
+
+        cur.execute(
+            "DELETE FROM payment_limits_payments "
+            "WHERE limit_month = %s AND period = %s AND stage = %s",
+            (month_val, period_val, stage)
+        )
+        replaced = cur.rowcount
+
+        rows = []
+        for p in payments:
+            rows.append((
+                month_val, period_val, stage,
+                p.get('article') or '',
+                p.get('detail_limit') or '',
+                p.get('amount') or 0,
+                p.get('recipient') or '',
+                p.get('request_no') or '',
+                p.get('request_date'),
+                p.get('status') or '',
+                p.get('organization') or '',
+                p.get('subdivision') or '',
+                p.get('priority') or '',
+                p.get('purpose') or '',
+                p.get('payment_date'),
+                p.get('applicant') or '',
+                p.get('payment_type') or ''
+            ))
+
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO payment_limits_payments
+                    (limit_month, period, stage, article, detail_limit, amount,
+                     recipient, request_no, request_date, status,
+                     organization, subdivision, priority, purpose,
+                     payment_date, applicant, payment_type)
+                VALUES %s
+                """,
+                rows
+            )
+        conn.commit()
+        cur.close()
+        logger.info(f"Сохранён вариант «{stage}» лимитов: месяц {month_val}, P{period_val}, "
+                    f"{len(rows)} строк (заменено {replaced})")
+        return {'success': True, 'count': len(rows), 'replaced': replaced}
+    except Exception as e:
+        logger.error(f"Ошибка сохранения варианта «{stage}» лимитов: {e}", exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {'success': False, 'error': str(e)}
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+# ---------------- Реестр загрузок (исходный файл + снятые строки) ----------------
+
+_PLP_REGISTRY_META_SQL = """
+SELECT id, limit_month, period, file_name, sheet_name, row_count,
+       draft_removed_rows, draft_saved_at, draft_author,
+       final_removed_rows, final_saved_at, final_author, final_exported_at,
+       created_at, updated_at,
+       (file_bytes IS NOT NULL) AS has_file,
+       COALESCE(OCTET_LENGTH(file_bytes), 0) AS file_size
+  FROM payment_limits_registry
+"""
+
+
+def save_payment_limits_registry(month, period, stage, file_name=None, sheet_name=None,
+                                 file_bytes=None, row_count=None, removed_rows=None, author=''):
+    """
+    Сохраняет/обновляет реестр месяца + периода: исходный файл (один раз) и
+    набор снятых чекбоксами строк для указанной стадии.
+
+    Returns:
+        dict — {'success': True, 'registry_id': N} или {'success': False, 'error': '...'}
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        month_val = _PLP_MONTH(month)
+        period_val = int(period)
+        removed_json = json.dumps(sorted({int(r) for r in (removed_rows or [])}))
+
+        cur.execute(
+            """
+            INSERT INTO payment_limits_registry (limit_month, period, file_name, sheet_name, file_bytes, row_count)
+            VALUES (%s, %s, COALESCE(%s, ''), COALESCE(%s, ''), %s, COALESCE(%s, 0))
+            ON CONFLICT (limit_month, period) DO NOTHING
+            """,
+            (month_val, period_val, file_name or '', sheet_name or '',
+             psycopg2.Binary(file_bytes) if file_bytes else None, row_count)
+        )
+
+        if file_bytes:
+            cur.execute(
+                """
+                UPDATE payment_limits_registry
+                   SET file_bytes = %s,
+                       file_name  = COALESCE(NULLIF(%s, ''), file_name),
+                       sheet_name = COALESCE(NULLIF(%s, ''), sheet_name),
+                       row_count  = COALESCE(%s, row_count),
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE limit_month = %s AND period = %s
+                """,
+                (psycopg2.Binary(file_bytes), file_name or '', sheet_name or '', row_count,
+                 month_val, period_val)
+            )
+
+        if stage == PLP_STAGE_DRAFT:
+            cur.execute(
+                """
+                UPDATE payment_limits_registry
+                   SET draft_removed_rows = %s::jsonb,
+                       draft_saved_at = CURRENT_TIMESTAMP,
+                       draft_author = %s,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE limit_month = %s AND period = %s
+                """,
+                (removed_json, author or '', month_val, period_val)
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE payment_limits_registry
+                   SET final_removed_rows = %s::jsonb,
+                       final_saved_at = CURRENT_TIMESTAMP,
+                       final_author = %s,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE limit_month = %s AND period = %s
+                """,
+                (removed_json, author or '', month_val, period_val)
+            )
+
+        cur.execute(
+            "SELECT id FROM payment_limits_registry WHERE limit_month = %s AND period = %s",
+            (month_val, period_val)
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        logger.info(f"Реестр лимитов сохранён: месяц {month_val}, P{period_val}, стадия «{stage}», "
+                    f"снято строк {len(json.loads(removed_json))}, файл {'обновлён' if file_bytes else 'не менялся'}")
+        return {'success': True, 'registry_id': (row[0] if row else None)}
+    except Exception as e:
+        logger.error(f"Ошибка сохранения реестра лимитов: {e}", exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {'success': False, 'error': str(e)}
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_payment_limits_registry(month, period=None):
+    """Метаданные реестра(ов) за месяц (без байтов файла)."""
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        if period:
+            cur.execute(_PLP_REGISTRY_META_SQL + " WHERE limit_month = %s AND period = %s",
+                        (_PLP_MONTH(month), int(period)))
+        else:
+            cur.execute(_PLP_REGISTRY_META_SQL + " WHERE limit_month = %s ORDER BY period",
+                        (_PLP_MONTH(month),))
+        rows = cur.fetchall()
+        cur.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Ошибка получения реестра лимитов за {month}: {e}")
+        return []
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_payment_limits_registry_by_id(registry_id):
+    """Метаданные одного реестра по id (без байтов файла)."""
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(_PLP_REGISTRY_META_SQL + " WHERE id = %s", (int(registry_id),))
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Ошибка получения реестра лимитов #{registry_id}: {e}")
+        return None
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def mark_payment_limits_registry_exported(registry_id):
+    """
+    Отмечает, что финальный файл сохранённого реестра выгружен.
+    Используется для уведомления (красный кружок) на кнопке «Экспорт в Excel».
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE payment_limits_registry SET final_exported_at = CURRENT_TIMESTAMP "
+            "WHERE id = %s RETURNING final_exported_at",
+            (int(registry_id),)
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        if not row:
+            return {'success': False, 'error': 'Реестр не найден'}
+        logger.info(f"Реестр лимитов #{registry_id}: финальный файл выгружен")
+        return {'success': True,
+                'final_exported_at': row[0].isoformat() if row[0] else None}
+    except Exception as e:
+        logger.error(f"Ошибка отметки выгрузки реестра {registry_id}: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {'success': False, 'error': str(e)}
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_payment_limits_registry_file(registry_id):
+    """Исходный файл реестра: (file_name, bytes) либо (None, None)."""
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT file_name, file_bytes FROM payment_limits_registry WHERE id = %s",
+                    (int(registry_id),))
+        row = cur.fetchone()
+        cur.close()
+        if not row or row[1] is None:
+            return None, None
+        return row[0], bytes(row[1])
+    except Exception as e:
+        logger.error(f"Ошибка получения файла реестра {registry_id}: {e}")
+        return None, None
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def reset_payment_limits(month, period=None, stage=None):
+    """
+    Обнуляет сохранённые данные контроля лимитов за месяц: удаляет платежи
+    (при необходимости — только выбранной стадии) и реестр вместе с исходным файлом.
+
+    Args:
+        month: 'YYYY-MM' или 'YYYY-MM-01'
+        period: 1..4 — ограничить обнуление одним периодом (необязательно)
+        stage: 'draft' | 'final' — удалить только эту стадию (необязательно)
+
+    Returns:
+        dict — {'success': True, 'payments_deleted': N, 'registries_deleted': M}
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        month_val = _PLP_MONTH(month)
+
+        sql = "DELETE FROM payment_limits_payments WHERE limit_month = %s"
+        params = [month_val]
+        if period:
+            sql += " AND period = %s"
+            params.append(int(period))
+        if stage:
+            sql += " AND stage = %s"
+            params.append(stage)
+        cur.execute(sql, tuple(params))
+        payments_deleted = cur.rowcount
+
+        sql = "DELETE FROM payment_limits_registry WHERE limit_month = %s"
+        params = [month_val]
+        if period:
+            sql += " AND period = %s"
+            params.append(int(period))
+        if stage:
+            # Обнуляем только выбранную стадию: исходный файл нужен другой стадии, поэтому строку реестра сохраняем
+            upd = (f"UPDATE payment_limits_registry "
+                   f"SET {stage}_removed_rows = '[]'::jsonb, {stage}_saved_at = NULL, "
+                   f"{stage}_author = '', updated_at = CURRENT_TIMESTAMP WHERE limit_month = %s")
+            upd_params = [month_val]
+            if period:
+                upd += " AND period = %s"
+                upd_params.append(int(period))
+            cur.execute(upd, tuple(upd_params))
+            registries_deleted = 0
+        else:
+            cur.execute(sql, tuple(params))
+            registries_deleted = cur.rowcount
+
+        conn.commit()
+        cur.close()
+        logger.info(f"Обнуление лимитов платежей: месяц {month_val}"
+                    + (f", P{period}" if period else "")
+                    + (f", стадия «{stage}»" if stage else "")
+                    + f" — удалено платежей {payments_deleted}, реестров {registries_deleted}")
+        return {'success': True, 'payments_deleted': payments_deleted,
+                'registries_deleted': registries_deleted}
+    except Exception as e:
+        logger.error(f"Ошибка обнуления лимитов платежей: {e}", exc_info=True)
         if conn:
             try:
                 conn.rollback()
@@ -2367,10 +2776,17 @@ def cleanup_payment_limits_before(month):
             (_PLP_MONTH(month),)
         )
         deleted = cur.rowcount
+        # Реестры (исходные файлы) прошлых месяцев тоже обнуляем
+        cur.execute(
+            "DELETE FROM payment_limits_registry WHERE limit_month < %s",
+            (_PLP_MONTH(month),)
+        )
+        deleted_registries = cur.rowcount
         conn.commit()
         cur.close()
-        if deleted:
-            logger.info(f"Автоочистка лимитов платежей: удалено {deleted} строк до месяца {_PLP_MONTH(month)}")
+        if deleted or deleted_registries:
+            logger.info(f"Автоочистка лимитов платежей: удалено {deleted} строк и "
+                        f"{deleted_registries} реестр(ов) до месяца {_PLP_MONTH(month)}")
         return deleted
     except Exception as e:
         logger.error(f"Ошибка автоочистки лимитов платежей: {e}")

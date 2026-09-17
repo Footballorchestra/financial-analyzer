@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS payment_limits_payments (
     id SERIAL PRIMARY KEY,
     limit_month DATE NOT NULL,               -- 'YYYY-MM-01' — месяц учёта (по дате подтверждения)
     period SMALLINT NOT NULL CHECK (period BETWEEN 1 AND 4),  -- P1..P4 по дате подтверждения
+    stage VARCHAR(10) NOT NULL DEFAULT 'final', -- стадия: 'draft' (черновик) | 'final' (финальный вариант)
     confirmed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, -- дата подтверждения
     article VARCHAR(255) NOT NULL,           -- Статья движения денежных средств
     detail_limit VARCHAR(255) DEFAULT '',    -- подстатья / детальный лимит (для «Аренда, Коммуналка, Связь»)
@@ -160,6 +161,30 @@ CREATE TABLE IF NOT EXISTS payment_limits_payments (
 
 CREATE INDEX IF NOT EXISTS idx_plp_month_period ON payment_limits_payments(limit_month, period);
 CREATE INDEX IF NOT EXISTS idx_plp_article ON payment_limits_payments(article);
+CREATE INDEX IF NOT EXISTS idx_plp_stage ON payment_limits_payments(limit_month, period, stage);
+
+-- Таблица 11а: Реестры загрузок лимитов — исходный файл + снятые чекбоксами строки по стадиям.
+-- Нужна, чтобы варианты (черновик/финал) и финальный файл были доступны с любого компьютера,
+-- и обнуляется вместе с платежами по истечении месяца.
+CREATE TABLE IF NOT EXISTS payment_limits_registry (
+    id SERIAL PRIMARY KEY,
+    limit_month DATE NOT NULL,
+    period SMALLINT NOT NULL CHECK (period BETWEEN 1 AND 4),
+    file_name VARCHAR(500) DEFAULT '',
+    sheet_name VARCHAR(255) DEFAULT '',
+    file_bytes BYTEA,
+    row_count INTEGER DEFAULT 0,
+    draft_removed_rows JSONB DEFAULT '[]'::jsonb,
+    draft_saved_at TIMESTAMP,
+    draft_author VARCHAR(255) DEFAULT '',
+    final_removed_rows JSONB DEFAULT '[]'::jsonb,
+    final_saved_at TIMESTAMP,
+    final_author VARCHAR(255) DEFAULT '',
+    final_exported_at TIMESTAMP,          -- когда выгрузили финальный файл (для уведомления)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (limit_month, period)
+);
 
 -- Таблица 11: Настройки лимитов платежей (редактируются в интерфейсе; одна строка id = 1)
 CREATE TABLE IF NOT EXISTS payment_limits_config (

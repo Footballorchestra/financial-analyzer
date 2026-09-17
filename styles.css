@@ -3164,16 +3164,32 @@ tr.recon-row-only_excel:hover {
 .pl-actions {
     display: flex;
     gap: 12px;
-    justify-content: flex-end;
-    margin-top: 16px;
-    padding: 16px;
-    background: var(--bg-tertiary, #f8fafc);
-    border: 1px solid var(--border-medium, #e2e8f0);
-    border-radius: 10px;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    /* Компактная полоса действий: прижата к нижнему краю экрана и всегда видна */
     position: sticky;
-    bottom: 12px;
-    z-index: 5;
-    box-shadow: 0 -2px 12px rgba(15, 23, 42, 0.06);
+    bottom: 0;
+    z-index: 20;
+    margin-top: 16px;
+    padding: 10px 14px;
+    background: var(--bg-tertiary, #f8fafc);
+    border: 1px solid var(--border-light, #e2e8f0);
+    border-radius: 10px;
+    box-shadow: 0 -2px 8px rgba(15, 23, 42, 0.05);
+}
+
+.pl-actions-info {
+    font-size: 12px;
+    color: var(--text-secondary, #475569);
+    margin-right: auto;
+}
+
+.pl-actions-buttons {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
 }
 
 /* Сводные карточки */
@@ -3281,7 +3297,6 @@ tr.recon-row-only_excel:hover {
 .pl-unmatched td {
     background: rgba(245, 158, 11, 0.06);
     color: var(--text-secondary, #64748b);
-    font-style: italic;
 }
 
 .pl-cell-td {
@@ -3398,6 +3413,17 @@ tr.recon-row-only_excel:hover {
     .pl-actions {
         position: static;
         flex-direction: column;
+        align-items: stretch;
+    }
+
+    .pl-actions-info {
+        margin-right: 0;
+        text-align: center;
+    }
+
+    .pl-actions-buttons {
+        flex-direction: column;
+        align-items: stretch;
     }
 
     .pl-actions .btn {
@@ -3658,6 +3684,435 @@ tr.recon-row-only_excel:hover {
 .pl-empty-filter {
     text-align: center;
     color: var(--text-secondary, #64748b);
-    font-style: italic;
     padding: 16px;
+}
+
+/* Лимиты платежей: выбор заявок чекбоксами и счётчик выбранного */
+.pl-check-col {
+    width: 34px;
+    text-align: center;
+}
+
+.pl-requests-table td.pl-check-cell {
+    text-align: center;
+}
+
+.pl-requests-table input[type="checkbox"] {
+    margin: 0;
+    width: 15px;
+    height: 15px;
+    cursor: pointer;
+    accent-color: var(--primary, #2563eb);
+}
+
+.pl-select-btns {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+
+.pl-select-btn {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary, #475569);
+    background: var(--bg-tertiary, #f8fafc);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 6px;
+    padding: 3px 8px;
+    cursor: pointer;
+}
+
+.pl-select-btn:hover {
+    border-color: var(--primary, #2563eb);
+    color: var(--primary, #2563eb);
+}
+
+.pl-row-unchecked td {
+    color: var(--text-tertiary, #94a3b8);
+}
+
+/* ============================================================
+   ЛИМИТЫ ПЛАТЕЖЕЙ: ЕДИНАЯ ТИПОГРАФИКА ВО ВСЕХ БЛОКАХ
+   Один шрифт, один размер и одна насыщенность у одинаковых элементов:
+   данные — 12px/400, суммы и итоги — 12px/600, заголовки таблиц — 11px/600
+   (без капса), подписи — 11px/400, без курсива.
+   ============================================================ */
+#payment-limits-page .pl-block,
+#payment-limits-page .pl-block * {
+    font-family: inherit;
+    font-style: normal;
+    letter-spacing: normal;
+    text-transform: none;
+}
+
+/* Заголовок блока и подпись в нём */
+#payment-limits-page .pl-block-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+#payment-limits-page .pl-block-title small {
+    font-size: 11px;
+    font-weight: 400;
+}
+
+/* Заголовки таблиц — без капса, одинаковые во всех блоках */
+#payment-limits-page .data-table thead th,
+#payment-limits-page .data-table thead th small {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+/* Данные во всех таблицах блоков */
+#payment-limits-page .pl-table td,
+#payment-limits-page .pl-table th,
+#payment-limits-page .pl-table-narrow td,
+#payment-limits-page .pl-requests-table td {
+    font-size: 12px;
+    font-weight: 400;
+}
+
+/* Названия категорий, подстатей и групп */
+#payment-limits-page .pl-article-name,
+#payment-limits-page .pl-cat-link {
+    font-size: 12px;
+    font-weight: 400;
+}
+
+/* Суммы в ячейках */
+#payment-limits-page .pl-amounts {
+    font-size: 12px;
+    font-weight: 400;
+}
+
+#payment-limits-page .pl-amounts b,
+#payment-limits-page .pl-amount {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* Строки «ИТОГО» и колонка «За месяц» */
+#payment-limits-page .pl-grand-row td,
+#payment-limits-page .pl-grand-row td *,
+#payment-limits-page .pl-month-total {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* Строка про глобальный лимит */
+#payment-limits-page .pl-global-row-tr td,
+#payment-limits-page .pl-global-row-tr td * {
+    font-size: 12px;
+    font-weight: 400;
+}
+
+#payment-limits-page .pl-global-label {
+    font-weight: 600;
+}
+
+/* Пояснения и служебные подписи */
+#payment-limits-page .pl-meta,
+#payment-limits-page .pl-of {
+    font-size: 11px;
+    font-weight: 400;
+}
+
+#payment-limits-page .pl-warn-label,
+#payment-limits-page .pl-unmatched td,
+#payment-limits-page .pl-empty-filter {
+    font-size: 11px;
+    font-weight: 400;
+    font-style: normal;
+}
+
+/* Чипы фильтра и кнопки выбора */
+#payment-limits-page .pl-filter-chip,
+#payment-limits-page .pl-select-btn {
+    font-size: 11px;
+    font-weight: 500;
+}
+
+/* Подпись в закреплённой полосе кнопок */
+#payment-limits-page .pl-actions-info {
+    font-size: 12px;
+    font-weight: 400;
+}
+
+/* ============================================================
+   ЛИМИТЫ ПЛАТЕЖЕЙ: КНОПКА ЭКСПОРТА С УВЕДОМЛЕНИЕМ
+   Красный кружок появляется, когда финальный вариант согласован
+   (2-я стадия сохранена), и исчезает после выгрузки файла.
+   ============================================================ */
+.pl-export-btn {
+    position: relative;
+}
+
+.btn-badge {
+    position: absolute;
+    top: -7px;
+    right: -7px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: var(--error, #dc2626);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
+    box-shadow: 0 0 0 2px var(--bg-card, #fff);
+    pointer-events: none;
+}
+
+/* ============================================================
+   ЛИМИТЫ ПЛАТЕЖЕЙ: БЛОК «ПОЯСНЕНИЯ» — СВОДНАЯ С ПРОКРУТКОЙ
+   Столбцы «Контрагент» и «Пояснение» закреплены, середина
+   (подразделения) прокручивается по горизонтали. Ничего не обрезается.
+   ============================================================ */
+.pl-exp-cats {
+    margin-bottom: 10px;
+}
+
+.pl-exp-count {
+    font-size: 10px;
+    font-weight: 400;
+    color: var(--text-tertiary, #94a3b8);
+    margin-left: 6px;
+}
+
+.pl-pivot-wrap {
+    width: 100%;
+    max-width: 100%;
+    /* Таблица прокручивается и по горизонтали (между закреплёнными столбцами), и по вертикали */
+    max-height: 70vh;
+    overflow: auto;
+    border: 1px solid var(--border-light, #e2e8f0);
+    border-radius: 8px;
+    background: var(--bg-card, #fff);
+}
+
+/* Таблица по содержимому: суммы не переносятся и не обрезаются */
+.pl-pivot {
+    width: max-content;
+    min-width: 100%;
+    table-layout: auto;
+    font-size: 12px;
+    margin: 0;
+    /* separate нужен, чтобы «прилипающие» ячейки корректно рисовали границы */
+    border-collapse: separate;
+    border-spacing: 0;
+}
+
+.pl-pivot th,
+.pl-pivot td {
+    padding: 5px 9px;
+    border-bottom: 1px solid var(--border-light, #e2e8f0);
+    white-space: nowrap;
+    vertical-align: middle;
+}
+
+/* Шапка закреплена сверху — при прокрутке вниз видно, в какой колонке смотрим */
+.pl-pivot thead th {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    text-align: center;
+    white-space: nowrap;
+    background: var(--bg-card, #fff);
+    border-bottom: 1px solid var(--border-medium, #e2e8f0);
+}
+
+/* Закреплённый первый столбец — контрагент (не шире ~15 символов + многоточие) */
+.pl-pivot .pl-pivot-name-col,
+.pl-pivot .pl-pivot-name {
+    position: sticky;
+    left: 0;
+    z-index: 3;
+    text-align: left;
+    width: 16ch;
+    max-width: 16ch;
+    background: var(--bg-card, #fff);
+    box-shadow: 2px 0 4px -2px rgba(15, 23, 42, 0.18);
+}
+
+.pl-pivot .pl-pivot-name .pl-cat-link {
+    display: inline-block;
+    max-width: 16ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+}
+
+/* Закреплённый последний столбец — пояснение */
+.pl-pivot .pl-pivot-exp-col,
+.pl-pivot .pl-pivot-exp {
+    position: sticky;
+    right: 0;
+    z-index: 3;
+    text-align: left;
+    background: var(--bg-card, #fff);
+    box-shadow: -2px 0 4px -2px rgba(15, 23, 42, 0.18);
+}
+
+/* Угловые ячейки шапки перекрывают и строки, и соседние столбцы */
+.pl-pivot thead .pl-pivot-name-col,
+.pl-pivot thead .pl-pivot-exp-col {
+    z-index: 6;
+}
+
+.pl-pivot .pl-pivot-num { text-align: right; }
+.pl-pivot .pl-pivot-total { font-weight: 600; }
+.pl-pivot .pl-pivot-zero { color: var(--text-tertiary, #cbd5e1); }
+.pl-pivot .pl-pivot-exp { padding: 3px 6px; }
+
+/* Кнопки-фильтры в шапке и в первом столбце */
+.pl-pivot .pl-pivot-sub .pl-cat-link { font-weight: 600; }
+.pl-pivot .pl-pivot-name .pl-cat-link { white-space: nowrap; }
+
+/* Активный фильтр (нажатая кнопка) подсвечивается */
+.pl-pivot .pl-pivot-active,
+.pl-pivot .pl-pivot-active .pl-cat-link {
+    background: var(--primary-50, #eff6ff);
+}
+
+/* Итоговая строка */
+.pl-pivot .pl-grand-row td {
+    background: var(--bg-tertiary, #f8fafc);
+    border-top: 2px solid var(--border-medium, #e2e8f0);
+}
+
+.pl-pivot .pl-grand-row .pl-pivot-name,
+.pl-pivot .pl-grand-row .pl-pivot-exp {
+    background: var(--bg-tertiary, #f8fafc);
+}
+
+/* Поле пояснения: выглядит как текст, при наведении и фокусе — как поле ввода */
+.pl-exp-input {
+    font: inherit;
+    color: inherit;
+    padding: 3px 5px;
+    border: 1px dashed transparent;
+    border-radius: 6px;
+    background: transparent;
+}
+
+.pl-exp-input::placeholder {
+    color: var(--text-tertiary, #94a3b8);
+    font-style: normal;
+}
+
+.pl-exp-input:hover {
+    border-color: var(--border-light, #e2e8f0);
+    background: var(--bg-card, #fff);
+}
+
+.pl-exp-input:focus {
+    outline: none;
+    border-color: var(--primary, #2563eb);
+    background: var(--bg-card, #fff);
+}
+
+/* Нет пояснения — видно, что нужно заполнить */
+.pl-exp-input.pl-exp-missing {
+    border-color: var(--border-medium, #cbd5e1);
+    color: var(--text-tertiary, #94a3b8);
+}
+
+/* Только что сохранено */
+.pl-exp-input.pl-exp-saved {
+    border-color: var(--success, #059669);
+    background: var(--success-light, #d1fae5);
+}
+
+/* ============================================================
+   ЛИМИТЫ ПЛАТЕЖЕЙ: ГОРИЗОНТАЛЬНОЕ МЕНЮ БЛОКОВ (ВКЛАДКИ)
+/* Лимиты платежей: горизонтальное меню блоков (вкладки).
+   Активная вкладка определяется радио-кнопкой — выделена всегда ровно одна.
+   Вид компактный: светлая «дорожка», внутри плоские вкладки, активная — белая карточка. */
+.pl-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    width: fit-content;
+    max-width: 100%;
+    padding: 3px;
+    margin-bottom: 16px;
+    background: var(--bg-tertiary, #f1f5f9);
+    border: 1px solid var(--border-light, #e2e8f0);
+    border-radius: var(--radius-md, 8px);
+}
+
+/* Сами радио-кнопки скрыты, визуально работает label */
+.pl-tabs .pl-tab-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.pl-tabs .pl-tab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 12px;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.3;
+    color: var(--text-secondary, #475569);
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm, 6px);
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+
+.pl-tabs .pl-tab-btn i {
+    font-size: 12px;
+    color: var(--text-tertiary, #94a3b8);
+}
+
+/* Наведение — только цвет, без «залипания» фона */
+.pl-tabs .pl-tab-btn:hover {
+    color: var(--primary, #2563eb);
+}
+
+.pl-tabs .pl-tab-btn:hover i {
+    color: var(--primary, #2563eb);
+}
+
+/* Активная вкладка — единственная, кого «заливает» */
+.pl-tabs .pl-tab-input:checked + .pl-tab-btn {
+    color: var(--primary, #2563eb);
+    background: var(--bg-card, #fff);
+    font-weight: 600;
+    box-shadow: var(--shadow-xs, 0 1px 2px rgba(0, 0, 0, 0.05));
+}
+
+.pl-tabs .pl-tab-input:checked + .pl-tab-btn i {
+    color: var(--primary, #2563eb);
+}
+
+.pl-tabs .pl-tab-input:focus-visible + .pl-tab-btn {
+    outline: 2px solid var(--primary, #2563eb);
+    outline-offset: 1px;
+}
+
+/* Групповые (общие) чекбоксы: «отметить все заявки категории/подстатьи/группы».
+   Небольшие и аккуратные, чтобы не выглядели как «нажатые кнопки». */
+.pl-toggle {
+    width: 13px;
+    height: 13px;
+    margin: 0 6px 0 0;
+    vertical-align: middle;
+    cursor: pointer;
+    accent-color: var(--primary, #2563eb);
 }

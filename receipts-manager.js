@@ -217,6 +217,23 @@ class ReceiptsManager {
         }
     }
 
+    // Дата в формате YYYY-MM-DD по локальному времени (без UTC-сдвига)
+    toIsoDate(date) {
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        return `${date.getFullYear()}-${m}-${d}`;
+    }
+
+    // Предыдущий рабочий день (пропускаем субботу и воскресенье).
+    // Поступления в файле относятся к предыдущему рабочему дню, а не к текущему.
+    getPreviousWorkingDayIso() {
+        const date = new Date();
+        do {
+            date.setDate(date.getDate() - 1);
+        } while (date.getDay() === 0 || date.getDay() === 6); // 0 — воскресенье, 6 — суббота
+        return this.toIsoDate(date);
+    }
+
     exportToExcel() {
         const transactions = this.getFilteredTransactions();
         if (transactions.length === 0) {
@@ -280,7 +297,14 @@ class ReceiptsManager {
         }
         ws['!cols'] = colWidths;
 
-        XLSX.writeFile(wb, `Поступления_${new Date().toISOString().split('T')[0]}.xlsx`, { cellStyles: true });
+        // Имя файла: по умолчанию — предыдущий рабочий день (поступления относятся к нему),
+        // при включённом чекбоксе «Имя файла текущей датой» — текущая дата
+        const useCurrentDate = document.getElementById('receiptsUseCurrentDate');
+        const fileDate = (useCurrentDate && useCurrentDate.checked)
+            ? this.toIsoDate(new Date())
+            : this.getPreviousWorkingDayIso();
+
+        XLSX.writeFile(wb, `Поступления_${fileDate}.xlsx`, { cellStyles: true });
     }
 
     clearSearch() {

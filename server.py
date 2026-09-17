@@ -7,6 +7,8 @@ from openpyxl.worksheet.views import Pane
 from copy import copy
 import io
 import base64
+import re
+import zipfile
 from datetime import datetime
 import json
 import traceback
@@ -71,7 +73,8 @@ limiter = Limiter(
 # ВАЖНО: expose_headers должен включать 'X-Filial-Data' для передачи данных филиалов
 # ============================================================
 CORS(app,
-     expose_headers=['X-Filial-Data', 'X-Allocation-Summary', 'X-Email-Data'],
+     expose_headers=['X-Filial-Data', 'X-Allocation-Summary', 'X-Email-Data',
+                     'X-Export-Removed', 'X-Export-Warning'],
      resources={r'/*': {'origins': '*'}})
 
 # ============================================================
@@ -2317,7 +2320,17 @@ def api_payment_limits_confirmed():
         month_first = month[:7] + '-01'
         db.cleanup_payment_limits_before(month_first)
 
-        rows = db.get_payment_limits_payments(month_first)
+        # stage: 'final' — только финал, 'draft' — черновик,
+        # 'effective' — финал, если он сохранён, иначе черновик (для накопительных итогов),
+        # 'all' — все стадии
+        stage = (request.args.get('stage') or db.PLP_STAGE_FINAL).strip().lower()
+        if stage == 'effective':
+            rows = db.get_payment_limits_payments(month_first, db.PLP_STAGE_FINAL) \
+                or db.get_payment_limits_payments(month_first, db.PLP_STAGE_DRAFT)
+        else:
+            if stage not in (db.PLP_STAGE_DRAFT, db.PLP_STAGE_FINAL):
+                stage = None
+            rows = db.get_payment_limits_payments(month_first, stage)
         # Денормализуем значения дат/сумм в JSON-совместимый вид
         result = []
         for r in rows:
@@ -2423,6 +2436,514 @@ def api_payment_limits_confirm():
         })
     except Exception as e:
         logger.error(f"Ошибка API payment-limits/confirm: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# ЭКСПОРТ РЕЕСТРА «ЛИМИТЫ ПЛАТЕЖЕЙ» — исходный файл без снятых заявок
+# ============================================================
+# Файл НЕ пересобирается заново: копируется исходный .xlsx (тема, стили, шрифты,
+# заливки, форматы, ширины/высоты, printerSettings, sharedStrings) и из XML листа
+# удаляются строки снятых заявок — с перенумерацией строк/адресов ячеек и поправкой
+# dimension, автофильтра и диапазонов условного форматирования (как это делает Excel).
+# Поэтому порядок и наполнение столбцов, «Дата заявки» (время по Москве) и оформление
+# остаются точно такими же, как в загруженном файле.
+_PL_ROW_RE = re.compile(r'<row[^>]*\br="(\d+)"[^>]*>.*?</row>', re.S)
+_PL_CF_RE = re.compile(r'<conditionalFormatting\b[^>]*sqref="([^"]+)"[^>]*>.*?</conditionalFormatting>', re.S)
+_PL_AF_RE = re.compile(r'(<autoFilter\b[^>]*\bref=")([A-Z]+)(\d+):([A-Z]+)(\d+)(")')
+_PL_DIM_RE = re.compile(r'(<dimension ref=")([A-Z]+)(\d+):([A-Z]+)(\d+)(")')
+_PL_FORMULA_RE = re.compile(r'<f[ >]')
+_PL_MERGE_RE = re.compile(r'<mergeCell\b')
+_PL_CELL_REF_TMPL = r'(?<=r=")([A-Z]{1,3})%d(?=")'
+
+
+def _pl_html_unescape(text):
+    """Мини-раскодирование XML-сущностей (для имён листов)."""
+    return (text.replace('&lt;', '<').replace('&gt;', '>')
+                .replace('&quot;', '"').replace('&apos;', "'").replace('&amp;', '&'))
+
+
+def _pl_parse_ref(ref):
+    """'D66' → ('D', 66); при неудаче — (None, None)."""
+    m = re.match(r'^([A-Z]+)(\d+)$', ref)
+    return (m.group(1), int(m.group(2))) if m else (None, None)
+
+
+def _pl_resolve_sheet_path(zf, sheet_name=None):
+    """Путь XML нужного листа внутри архива (по имени, иначе — первый лист)."""
+    try:
+        wb_xml = zf.read('xl/workbook.xml').decode('utf-8')
+        rels_xml = zf.read('xl/_rels/workbook.xml.rels').decode('utf-8')
+    except KeyError:
+        return 'xl/worksheets/sheet1.xml'
+
+    pairs = []
+    for tag in re.findall(r'<sheet\b[^>]*?>', wb_xml):
+        m_name = re.search(r'\bname="([^"]*)"', tag)
+        m_rid = re.search(r'\br:id="([^"]*)"', tag)
+        if m_name and m_rid:
+            pairs.append((_pl_html_unescape(m_name.group(1)), m_rid.group(1)))
+    if not pairs:
+        return 'xl/worksheets/sheet1.xml'
+
+    rel_map = dict(re.findall(r'<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"', rels_xml))
+    target_id = None
+    if sheet_name:
+        for name, rid in pairs:
+            if name == sheet_name:
+                target_id = rid
+                break
+    if target_id is None:
+        target_id = pairs[0][1]
+
+    target = rel_map.get(target_id, 'worksheets/sheet1.xml').lstrip('/')
+    return target if target.startswith('xl/') else 'xl/' + target
+
+
+def _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name=None):
+    """Удаляет строки (1-based, как в Excel) из листа xlsx.
+
+    raw — байты исходного .xlsx; возвращает (BytesIO с готовым файлом, info).
+    """
+    # Мусор в списке строк игнорируем, строку 1 (шапку) не удаляем
+    clean_rows = []
+    for value in (remove_rows or []):
+        try:
+            num = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if num > 1:
+            clean_rows.append(num)
+    remove_rows = sorted(set(clean_rows))
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        infos = z.infolist()
+        data = {i.filename: z.read(i.filename) for i in infos}
+        sheet_path = _pl_resolve_sheet_path(z, sheet_name)
+
+    if not remove_rows:
+        return io.BytesIO(raw), {'removed': 0, 'sheet': sheet_path, 'rows_left': None,
+                                 'byte_identical': True, 'warning': ''}
+
+    if sheet_path not in data:
+        raise ValueError('В файле не найден лист с данными')
+
+    xml = data[sheet_path].decode('utf-8')
+    warnings = []
+    if _PL_FORMULA_RE.search(xml):
+        warnings.append('в листе есть формулы — ссылки при удалении строк не пересчитываются')
+    if _PL_MERGE_RE.search(xml):
+        warnings.append('в листе есть объединённые ячейки — проверьте их после выгрузки')
+
+    def shift(r):
+        return r - sum(1 for d in remove_rows if d < r)
+
+    # 1. Удаление строк + перенумерация строк и адресов ячеек
+    row_matches = list(_PL_ROW_RE.finditer(xml))
+    if not row_matches:
+        raise ValueError('В листе не найдено строк для обработки')
+
+    parts, kept_numbers = [], []
+    for m in row_matches:
+        num = int(m.group(1))
+        if num in remove_rows:
+            continue
+        new_num = shift(num)
+        kept_numbers.append(new_num)
+        block = m.group(0)
+        tag_end = block.index('>')
+        open_tag, body = block[:tag_end + 1], block[tag_end + 1:]
+        open_tag = re.sub(r'\br="\d+"', f'r="{new_num}"', open_tag, count=1)  # сам <row r="N">
+        body = re.sub(_PL_CELL_REF_TMPL % num, lambda mm: mm.group(1) + str(new_num), body)  # ячейки
+        parts.append(open_tag + body)
+
+    new_last = max(kept_numbers) if kept_numbers else 1
+    xml = xml[:row_matches[0].start()] + ''.join(parts) + xml[row_matches[-1].end():]
+
+    # 2. dimension
+    if _PL_DIM_RE.search(xml):
+        xml = _PL_DIM_RE.sub(
+            lambda mm: f'{mm.group(1)}{mm.group(2)}{mm.group(3)}:{mm.group(4)}{new_last}{mm.group(6)}',
+            xml)
+
+    # 3. Условное форматирование — сдвигаем/обрезаем диапазоны, как Excel
+    if _PL_CF_RE.search(xml):
+        def fix_cf(mm):
+            sqref = mm.group(1)
+            new_ranges = []
+            for rng in sqref.split(' '):
+                a, _, b = rng.partition(':') if ':' in rng else (rng, ':', rng)
+                ca, ra = _pl_parse_ref(a)
+                cb, rb = _pl_parse_ref(b)
+                if ra is None or rb is None:
+                    new_ranges.append(rng)
+                    continue
+                if any(ra <= d <= rb for d in remove_rows):
+                    ns = ra - sum(1 for d in remove_rows if d < ra)
+                    ne = rb - sum(1 for d in remove_rows if d <= rb)
+                    if ne < ns:
+                        continue  # диапазон полностью удалён
+                    new_ranges.append(f'{ca}{ns}' if ns == ne else f'{ca}{ns}:{cb}{ne}')
+                else:
+                    new_ranges.append(rng)
+            if not new_ranges:
+                return ''
+            return mm.group(0).replace(f'sqref="{sqref}"', 'sqref="' + ' '.join(new_ranges) + '"')
+        xml = _PL_CF_RE.sub(fix_cf, xml)
+
+    # 4. Автофильтр — подрезаем по числу удалённых строк внутри диапазона
+    if _PL_AF_RE.search(xml):
+        def fix_af(mm):
+            start, end = int(mm.group(3)), int(mm.group(5))
+            new_end = end - sum(1 for d in remove_rows if start <= d <= end)
+            if new_end < 1:
+                return mm.group(0)
+            return f'{mm.group(1)}{mm.group(2)}{start}:{mm.group(4)}{new_end}{mm.group(6)}'
+        xml = _PL_AF_RE.sub(fix_af, xml)
+
+    data[sheet_path] = xml.encode('utf-8')
+
+    # 5. Пересборка архива: тот же порядок записей и способ сжатия
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+        for info in infos:
+            zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            zi.compress_type = info.compress_type
+            zi.external_attr = info.external_attr
+            zi.internal_attr = info.internal_attr
+            zi.create_system = info.create_system
+            zi.flag_bits = info.flag_bits & ~0x08
+            z.writestr(zi, data[info.filename])
+    out.seek(0)
+    return out, {'removed': len(remove_rows), 'sheet': sheet_path, 'rows_left': new_last,
+                 'byte_identical': False, 'warning': '; '.join(warnings)}
+
+
+def _plp_build_rows(rows, month_first, period, stage):
+    """Преобразует строки заявок из запроса в записи для payment_limits_payments."""
+    payments = []
+    for row in rows or []:
+        payments.append({
+            'limit_month': month_first,
+            'period': period,
+            'stage': stage,
+            'article': (row.get('article') or '').strip(),
+            'detail_limit': (row.get('detail_limit') or '').strip(),
+            'amount': float(row.get('amount') or 0),
+            'recipient': (row.get('recipient') or '').strip(),
+            'request_no': (row.get('request_no') or '').strip(),
+            'request_date': _parse_plp_date(row.get('request_date')),
+            'status': (row.get('status') or '').strip(),
+            'organization': (row.get('organization') or '').strip(),
+            'subdivision': (row.get('subdivision') or '').strip(),
+            'priority': (row.get('priority') or '').strip(),
+            'purpose': (row.get('purpose') or '').strip(),
+            'payment_date': _parse_plp_date(row.get('payment_date')),
+            'applicant': (row.get('applicant') or '').strip(),
+            'payment_type': (row.get('payment_type') or '').strip()
+        })
+    return payments
+
+
+@app.route('/api/payment-limits/save', methods=['POST'])
+@limiter.limit("20 per minute")
+def api_payment_limits_save():
+    """
+    Сохранение варианта загрузки (2 стадии подтверждения).
+
+    multipart/form-data:
+      file — исходный .xlsx (нужен хотя бы один раз: без него нельзя выгрузить финальный файл)
+      data — JSON: {stage: 'draft'|'final', rows: [...], removedRows: [...],
+                    period: 1..4, sheetName: '', fileName: '', author: '', registryId: N}
+
+    Черновик сохраняет первичный вариант, финал — итоговый после проверки коллегой.
+    Оба варианта и исходный файл хранятся в БД и обнуляются по истечении месяца.
+    """
+    try:
+        try:
+            data = json.loads(request.form.get('data') or '{}')
+        except Exception:
+            data = {}
+
+        stage = (data.get('stage') or db.PLP_STAGE_FINAL).strip().lower()
+        if stage not in (db.PLP_STAGE_DRAFT, db.PLP_STAGE_FINAL):
+            return jsonify({'success': False, 'error': 'Неверная стадия сохранения'}), 400
+
+        rows = data.get('rows') or []
+        removed_rows = data.get('removedRows') or []
+        file = request.files.get('file')
+        file_bytes = file.read() if file else None
+
+        now = datetime.now()
+        month_first = now.strftime('%Y-%m') + '-01'
+
+        period = None
+        try:
+            if data.get('period') is not None:
+                period = int(data.get('period'))
+        except (TypeError, ValueError):
+            period = None
+        if period is None or period < 1 or period > 4:
+            period = payment_period_for_date(now)
+
+        # Автоочистка: начало нового месяца — начинаем учёт заново
+        db.cleanup_payment_limits_before(month_first)
+
+        # Исходный файл обязателен: без него финальный файл выгрузить нечем
+        has_file = any(r.get('has_file') for r in db.get_payment_limits_registry(month_first, period))
+        if not file_bytes and not has_file:
+            return jsonify({'success': False,
+                            'error': 'Нет исходного файла реестра: загрузите файл ещё раз, '
+                                     'чтобы сохранить вариант'}), 400
+
+        reg_result = db.save_payment_limits_registry(
+            month=month_first,
+            period=period,
+            stage=stage,
+            file_name=(data.get('fileName') or '').strip(),
+            sheet_name=(data.get('sheetName') or '').strip(),
+            file_bytes=file_bytes,
+            row_count=int(data.get('rowCount') or len(rows) or 0),
+            removed_rows=removed_rows,
+            author=(data.get('author') or '').strip()
+        )
+        if not reg_result.get('success'):
+            return jsonify(reg_result), 500
+
+        save_result = db.save_payment_limits_stage(
+            month_first, period, stage, _plp_build_rows(rows, month_first, period, stage))
+        if not save_result.get('success'):
+            return jsonify(save_result), 500
+
+        total_amount = sum(float(r.get('amount') or 0) for r in rows)
+        stage_label = 'черновик' if stage == db.PLP_STAGE_DRAFT else 'финальный вариант'
+        logger.info(f"✅ Сохранён {stage_label} лимитов: {save_result['count']} заявок, "
+                    f"снято {len(removed_rows)}, сумма {total_amount:.2f} ₽, P{period}, месяц {month_first}")
+
+        return jsonify({
+            'success': True,
+            'stage': stage,
+            'month': month_first,
+            'period': period,
+            'count': save_result['count'],
+            'removed_count': len(removed_rows),
+            'total_amount': total_amount,
+            'registry_id': reg_result.get('registry_id'),
+            'saved_at': now.isoformat(timespec='seconds'),
+            'message': f"Сохранён {stage_label}: {save_result['count']} заявок "
+                       f"(период P{period}, {month_first[:7]})"
+        })
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/save: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/reset', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_payment_limits_reset():
+    """
+    Обнуление ранее загруженных данных контроля лимитов за месяц.
+
+    Тело: JSON {'month': 'YYYY-MM' (необязательно), 'period': 1..4 (необязательно),
+                'stage': 'draft'|'final' (необязательно)}.
+    Удаляются сохранённые варианты (черновик/финал), платежи и исходный файл реестра,
+    чтобы можно было пройти полный цикл (2 стадии) заново.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        now = datetime.now()
+        month = (data.get('month') or now.strftime('%Y-%m'))
+        month_first = str(month)[:7] + '-01'
+
+        period = data.get('period')
+        try:
+            period = int(period) if period not in (None, '') else None
+        except (TypeError, ValueError):
+            period = None
+        if period is not None and (period < 1 or period > 4):
+            period = None
+
+        stage = (data.get('stage') or '').strip().lower()
+        if stage not in (db.PLP_STAGE_DRAFT, db.PLP_STAGE_FINAL):
+            stage = None
+
+        result = db.reset_payment_limits(month_first, period, stage)
+        if not result.get('success'):
+            return jsonify(result), 500
+
+        logger.info(f"✅ Обнулены данные лимитов: месяц {month_first}"
+                    + (f", P{period}" if period else "")
+                    + (f", стадия «{stage}»" if stage else "")
+                    + f" — платежей {result['payments_deleted']}, реестров {result['registries_deleted']}")
+
+        return jsonify({
+            'success': True,
+            'month': month_first,
+            'period': period,
+            'stage': stage,
+            'payments_deleted': result['payments_deleted'],
+            'registries_deleted': result['registries_deleted'],
+            'message': 'Данные обнулены: удалено платежей '
+                       f"{result['payments_deleted']} и реестров {result['registries_deleted']}. "
+                       'Можно загрузить файл и пройти обе стадии заново'
+        })
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/reset: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/registry', methods=['GET'])
+def api_payment_limits_registry():
+    """
+    Состояние реестров за месяц: сохранённые варианты (черновик/финал) и исходный файл.
+
+    Query: month=YYYY-MM (по умолчанию текущий), period=1..4 (необязательно).
+    """
+    try:
+        now = datetime.now()
+        month = request.args.get('month') or now.strftime('%Y-%m')
+        month_first = month[:7] + '-01'
+        period = request.args.get('period')
+
+        # Начало нового месяца — учёт заново (платежи и реестры прошлых месяцев удаляются)
+        db.cleanup_payment_limits_before(month_first)
+
+        registries = db.get_payment_limits_registry(month_first, int(period) if period else None)
+        result = []
+        for r in registries:
+            item = dict(r)
+            for key in ('draft_saved_at', 'final_saved_at', 'final_exported_at', 'created_at', 'updated_at', 'limit_month'):
+                val = item.get(key)
+                if val is not None and hasattr(val, 'isoformat'):
+                    item[key] = val.isoformat(timespec='seconds') if key.endswith('_at') else val.isoformat()
+            item['file_size'] = int(item.get('file_size') or 0)
+            item['draft_removed_rows'] = item.get('draft_removed_rows') or []
+            item['final_removed_rows'] = item.get('final_removed_rows') or []
+            result.append(item)
+
+        return jsonify({
+            'success': True,
+            'month': month_first,
+            'period': payment_period_for_date(now),
+            'registries': result
+        })
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/registry: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/registry/file', methods=['GET'])
+def api_payment_limits_registry_file():
+    """Исходный файл сохранённого реестра (для просмотра/правки на другом компьютере)."""
+    try:
+        registry_id = request.args.get('registry_id')
+        if not registry_id:
+            return jsonify({'error': 'Не указан registry_id'}), 400
+        file_name, file_bytes = db.get_payment_limits_registry_file(int(registry_id))
+        if not file_bytes:
+            return jsonify({'error': 'Исходный файл реестра не найден'}), 404
+        return send_file(
+            io.BytesIO(file_bytes),
+            as_attachment=True,
+            download_name=file_name or f'Реестр_{registry_id}.xlsx',
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/registry/file: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/payment-limits/export', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_payment_limits_export():
+    """
+    Экспорт реестра заявок в исходном формате: исходный .xlsx без снятых чекбоксом строк.
+
+    Источник файла:
+      * загруженный в запросе файл (multipart 'file'); либо
+      * сохранённый в БД реестр (data.registryId) — тогда файл из браузера не нужен.
+    Снятые строки: data.removeRows (текущие отметки) либо сохранённый набор нужной стадии
+    (data.stage = 'final' | 'draft'; по умолчанию финал, если он сохранён).
+    """
+    try:
+        try:
+            data = json.loads(request.form.get('data') or '{}')
+        except Exception:
+            data = {}
+
+        registry_id = data.get('registryId')
+        stage = (data.get('stage') or '').strip().lower()
+        sheet_name = (data.get('sheetName') or '').strip() or None
+        remove_rows = data.get('removeRows')
+        file_name = None
+        used_stage = None
+
+        if 'file' in request.files:
+            file = request.files['file']
+            raw = file.read()
+            file_name = file.filename
+        elif registry_id:
+            meta = db.get_payment_limits_registry_by_id(int(registry_id))
+            if not meta or not meta.get('has_file'):
+                return jsonify({'error': 'Исходный файл реестра не найден в базе. '
+                                         'Загрузите файл и сохраните вариант заново'}), 404
+            file_name = meta.get('file_name') or f'Реестр_{registry_id}.xlsx'
+            if not sheet_name:
+                sheet_name = (meta.get('sheet_name') or '').strip() or None
+            # Какая стадия фактически выгружается
+            used_stage = stage if stage in (db.PLP_STAGE_DRAFT, db.PLP_STAGE_FINAL) \
+                else (db.PLP_STAGE_FINAL if meta.get('final_saved_at') else db.PLP_STAGE_DRAFT)
+            if remove_rows is None:
+                # Берём сохранённый набор нужной стадии
+                remove_rows = (meta.get('final_removed_rows') or []) if used_stage == db.PLP_STAGE_FINAL \
+                    else (meta.get('draft_removed_rows') or [])
+            _, raw = db.get_payment_limits_registry_file(int(registry_id))
+        else:
+            return jsonify({'error': 'Не передан исходный файл'}), 400
+
+        if not raw:
+            return jsonify({'error': 'Пустой файл'}), 400
+        if remove_rows is None:
+            remove_rows = []
+
+        try:
+            result, info = _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name)
+        except zipfile.BadZipFile:
+            return jsonify({'error': 'Экспорт доступен только для файлов .xlsx '
+                                     '(файл не является книгой Excel 2007+). Сохраните реестр как .xlsx'}), 400
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+
+        logger.info(f"✅ Экспорт реестра лимитов: файл «{file_name}»"
+                    + (f" (реестр #{registry_id}, стадия «{stage or 'авто'}»)" if registry_id else '')
+                    + f", снято строк {info['removed']}, осталось строк {info['rows_left']}, лист {info['sheet']}"
+                    + (f", предупреждение: {info['warning']}" if info.get('warning') else ''))
+
+        response = send_file(
+            result,
+            as_attachment=True,
+            download_name=f"Заявки_лимиты_{datetime.now().strftime('%d.%m.%Y')}.xlsx",
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response.headers['X-Export-Removed'] = str(info['removed'])
+        if info.get('warning'):
+            response.headers['X-Export-Warning'] = urllib.parse.quote(info['warning'])
+
+        # Выгрузили финальный вариант — снимаем уведомление «можно выгружать»
+        exported_final_at = None
+        if registry_id and used_stage == db.PLP_STAGE_FINAL:
+            marked = db.mark_payment_limits_registry_exported(int(registry_id))
+            if marked.get('success'):
+                exported_final_at = marked.get('final_exported_at')
+                response.headers['X-Export-Final-At'] = str(exported_final_at or '')
+        return response
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/export: {e}")
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 

@@ -335,6 +335,10 @@
                             <p class="page-description">Просмотр и анализ всех входящих платежей</p>
                         </div>
                         <div class="header-actions">
+                            <label class="checkbox-label" title="Если включено — файл экспорта называется текущей датой. По умолчанию — предыдущим рабочим днём (поступления относятся к нему)">
+                                <input type="checkbox" id="receiptsUseCurrentDate">
+                                <span>Имя файла текущей датой</span>
+                            </label>
                             <button id="innUploadBtn" class="btn btn-secondary">
                                 <i class="fas fa-id-card"></i> Загрузить ИНН
                             </button>
@@ -888,10 +892,21 @@
                             <button id="plLimitsSettingsBtn" class="btn btn-secondary">
                                 <i class="fas fa-sliders-h"></i> Настроить лимиты
                             </button>
+                            <button id="exportPaymentLimitsBtn" class="btn btn-success pl-export-btn" disabled
+                                    title="Скачать заявки в исходном формате файла (только отмеченные)">
+                                <i class="fas fa-file-excel"></i> Экспорт в Excel
+                                <span class="btn-badge" id="exportPaymentLimitsBadge" hidden
+                                      title="Финальный вариант согласован — можно выгружать">1</span>
+                            </button>
+                            <button id="resetPaymentLimitsBtn" class="btn btn-danger"
+                                    title="Удалить ранее загруженные данные за текущий месяц: черновик, финальный вариант, платежи и исходный файл реестра. Позволяет пройти полный цикл заново">
+                                <i class="fas fa-eraser"></i> Обнулить загруженное
+                            </button>
                             <div class="pl-header-info">
                                 <span class="pl-info-item"><i class="fas fa-calendar-day"></i> Текущая дата: <strong id="plHeaderDate">—</strong></span>
                                 <span class="pl-info-item"><i class="fas fa-hourglass-half"></i> Период загрузки: <strong id="plHeaderPeriod">—</strong></span>
                                 <span class="pl-info-item"><i class="fas fa-calendar-alt"></i> Месяц учёта: <strong id="plHeaderMonth">—</strong></span>
+                                <span class="pl-info-item"><i class="fas fa-database"></i> Сохранённый вариант: <strong id="plRegistryState">—</strong></span>
                             </div>
                         </div>
                     </div>
@@ -915,17 +930,56 @@
                         <span class="pl-empty-hint" id="plEmptyHint"></span>
                     </div>
 
-                    <!-- Контрольная панель: подтверждённые данные из БД + превью -->
+                    <!-- Горизонтальное меню блоков: показывается один выбранный блок,
+                         а список заявок ниже доступен всегда.
+                         Реализовано на радио-кнопках — активной всегда ровно одна вкладка. -->
+                    <div class="pl-tabs" id="plTabs">
+                        <input type="radio" class="pl-tab-input" name="plTabs" id="plTabControl" value="control" checked>
+                        <label class="pl-tab-btn" for="plTabControl" title="Контроль лимитов по периодам P1–P4">
+                            <i class="fas fa-table"></i> Контроль по периодам
+                        </label>
+
+                        <input type="radio" class="pl-tab-input" name="plTabs" id="plTabSummary" value="summary">
+                        <label class="pl-tab-btn" for="plTabSummary" title="Лимит текущего периода и накопительный итог">
+                            <i class="fas fa-chart-line"></i> Лимит текущего периода
+                        </label>
+
+                        <input type="radio" class="pl-tab-input" name="plTabs" id="plTabDetail" value="detail">
+                        <label class="pl-tab-btn" for="plTabDetail" title="Детальный контроль по подстатьям (Аренда, Коммуналка, Связь)">
+                            <i class="fas fa-sliders-h"></i> Детальный контроль
+                        </label>
+
+                        <input type="radio" class="pl-tab-input" name="plTabs" id="plTabGroups" value="groups">
+                        <label class="pl-tab-btn" for="plTabGroups" title="Разбивка на категории по колонке «Группа» из файла">
+                            <i class="fas fa-layer-group"></i> Разбивка на категории
+                        </label>
+
+                        <input type="radio" class="pl-tab-input" name="plTabs" id="plTabExplanations" value="explanations">
+                        <label class="pl-tab-btn" for="plTabExplanations" title="Сводная по контрагентам с пояснениями из «Библиотеки контрагентов»">
+                            <i class="fas fa-comment-dots"></i> Пояснения
+                        </label>
+                    </div>
+
+                    <!-- Контрольная панель: выбранный блок + список заявок -->
                     <div id="plControlArea"></div>
 
-                    <!-- Кнопки подтверждения -->
+                    <!-- Кнопки сохранения: 1-я стадия — черновик, 2-я стадия — финальный вариант.
+                         Полоса закреплена внизу экрана и всегда видна. -->
                     <div id="plActions" class="pl-actions" style="display: none;">
-                        <button id="confirmPaymentLimitsBtn" class="btn btn-success">
-                            <i class="fas fa-check-circle"></i> Подтвердить и сохранить
-                        </button>
-                        <button id="cancelPaymentLimitsBtn" class="btn btn-secondary">
-                            <i class="fas fa-times"></i> Отменить
-                        </button>
+                        <span class="pl-actions-info" id="plActionsInfo"></span>
+                        <span class="pl-actions-buttons">
+                            <button id="saveDraftPaymentLimitsBtn" class="btn btn-secondary"
+                                    title="Первичное сохранение: вариант становится доступен коллегам на других компьютерах">
+                                <i class="fas fa-file-signature"></i> Сохранить черновик (стадия 1)
+                            </button>
+                            <button id="saveFinalPaymentLimitsBtn" class="btn btn-success"
+                                    title="Финальный вариант: после проверки и правок. Именно он выгружается в Excel">
+                                <i class="fas fa-check-circle"></i> Сохранить финальный вариант (стадия 2)
+                            </button>
+                            <button id="cancelPaymentLimitsBtn" class="btn btn-secondary">
+                                <i class="fas fa-times"></i> Отменить
+                            </button>
+                        </span>
                     </div>
                 </div>
 
