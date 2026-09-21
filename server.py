@@ -2325,8 +2325,9 @@ def api_payment_limits_confirmed():
         # 'all' — все стадии
         stage = (request.args.get('stage') or db.PLP_STAGE_FINAL).strip().lower()
         if stage == 'effective':
-            rows = db.get_payment_limits_payments(month_first, db.PLP_STAGE_FINAL) \
-                or db.get_payment_limits_payments(month_first, db.PLP_STAGE_DRAFT)
+            # По каждой сохранённой загрузке (партии) берём финал, иначе черновик;
+            # строки всех загрузок периода складываются.
+            rows = db.get_payment_limits_effective(month_first)
         else:
             if stage not in (db.PLP_STAGE_DRAFT, db.PLP_STAGE_FINAL):
                 stage = None
@@ -2690,12 +2691,27 @@ def api_payment_limits_save():
         # Автоочистка: начало нового месяца — начинаем учёт заново
         db.cleanup_payment_limits_before(month_first)
 
-        # Исходный файл обязателен: без него финальный файл выгрузить нечем
+        # Партия (загрузка): если registryId не передан — это новая загрузка реестра,
+        # её строки будут накапливаться вместе с ранее сохранёнными загрузками периода.
+        registry_id = None
+        try:
+            if data.get('registryId') is not None:
+                registry_id = int(data.get('registryId'))
+        except (TypeError, ValueError):
+            registry_id = None
+
+        # Исходный файл: для новой загрузки он обязателен
         has_file = any(r.get('has_file') for r in db.get_payment_limits_registry(month_first, period))
-        if not file_bytes and not has_file:
+        if not file_bytes and registry_id is None:
             return jsonify({'success': False,
                             'error': 'Нет исходного файла реестра: загрузите файл ещё раз, '
                                      'чтобы сохранить вариант'}), 400
+        if not file_bytes and registry_id is not None:
+            reg_meta = db.get_payment_limits_registry_by_id(registry_id)
+            if not reg_meta or not reg_meta.get('has_file'):
+                return jsonify({'success': False,
+                                'error': 'Нет исходного файла реестра: загрузите файл ещё раз, '
+                                         'чтобы сохранить вариант'}), 400
 
         reg_result = db.save_payment_limits_registry(
             month=month_first,
@@ -2706,20 +2722,23 @@ def api_payment_limits_save():
             file_bytes=file_bytes,
             row_count=int(data.get('rowCount') or len(rows) or 0),
             removed_rows=removed_rows,
-            author=(data.get('author') or '').strip()
+            author=(data.get('author') or '').strip(),
+            registry_id=registry_id
         )
         if not reg_result.get('success'):
             return jsonify(reg_result), 500
 
         save_result = db.save_payment_limits_stage(
-            month_first, period, stage, _plp_build_rows(rows, month_first, period, stage))
+            month_first, period, stage, _plp_build_rows(rows, month_first, period, stage),
+            registry_id=reg_result.get('registry_id'))
         if not save_result.get('success'):
             return jsonify(save_result), 500
 
         total_amount = sum(float(r.get('amount') or 0) for r in rows)
         stage_label = 'черновик' if stage == db.PLP_STAGE_DRAFT else 'финальный вариант'
         logger.info(f"✅ Сохранён {stage_label} лимитов: {save_result['count']} заявок, "
-                    f"снято {len(removed_rows)}, сумма {total_amount:.2f} ₽, P{period}, месяц {month_first}")
+                    f"снято {len(removed_rows)}, сумма {total_amount:.2f} ₽, P{period}, "
+                    f"загрузка #{reg_result.get('registry_id')}, месяц {month_first}")
 
         return jsonify({
             'success': True,
@@ -2730,6 +2749,7 @@ def api_payment_limits_save():
             'removed_count': len(removed_rows),
             'total_amount': total_amount,
             'registry_id': reg_result.get('registry_id'),
+            'new_registry': bool(reg_result.get('created')),
             'saved_at': now.isoformat(timespec='seconds'),
             'message': f"Сохранён {stage_label}: {save_result['count']} заявок "
                        f"(период P{period}, {month_first[:7]})"

@@ -2183,13 +2183,10 @@ class App {
                 if (!manager.confirmedLoaded) {
                     await manager.loadConfirmed(manager.currentMonth);
                 }
-                // Обновляем состояние сохранённого варианта месяца
+                // Обновляем список сохранённых загрузок месяца
                 await manager.loadRegistryState();
-                // Если загружен тот же файл, что уже сохранён за месяц, — не суммируем его с БД
-                if (manager.adoptRegistryIfSameFile(file)) {
-                    this.showNotification('Это тот же файл, что уже сохранён за месяц: '
-                        + 'применены сохранённые отметки, данные не суммируются', 'info');
-                }
+                // Ручная загрузка — это новая партия: не продолжаем ранее сохранённую
+                manager.markAsNewUpload();
                 this.renderPaymentLimitsUI();
                 this.showNotification(result.message + '. Период загрузки: ' + manager.periodLabel(manager.currentPeriod), 'success');
             } else {
@@ -2211,7 +2208,9 @@ class App {
         try {
             const result = await manager.saveStage(stage);
             if (result.success) {
-                // После сохранения перечитываем сохранённый вариант (для накопительных итогов)
+                // После сохранения обновляем список сохранённых загрузок периода
+                // и перечитываем сохранённые данные (для накопительных итогов)
+                await manager.loadRegistryState();
                 await manager.loadConfirmed(manager.currentMonth);
                 this.renderPaymentLimitsUI();
                 this.showNotification(result.message, 'success');

@@ -167,8 +167,8 @@ class PaymentLimitsManager {
             const now = new Date();
             this.sourceFile = file;               // исходный файл — для экспорта без пересборки
             this.sourceSheetName = sheetName;
-            // Это новый (загруженный вручную) набор — его можно складывать с данными БД
-            this.previewIsSavedCopy = false;
+            // Ручная загрузка — это новая партия периода (складывается с сохранёнными)
+            this.markAsNewUpload();
             this.previewRows = preview;
             // Период загрузки: выбранный пользователем либо авто по дате загрузки
             this.currentPeriod = this.getLoadPeriod();
@@ -179,6 +179,13 @@ class PaymentLimitsManager {
             console.error('Ошибка загрузки файла лимитов:', error);
             return { success: false, message: 'Ошибка загрузки: ' + error.message };
         }
+    }
+
+    // Загрузка вручную — это НОВАЯ партия (загрузка) периода: при сохранении
+    // она добавится к ранее сохранённым загрузкам, а не заменит их.
+    markAsNewUpload() {
+        this.registry = null;              // не продолжаем ранее сохранённую загрузку
+        this.previewIsSavedCopy = false;   // превью складывается с сохранёнными загрузками
     }
 
     readExcelFile(file) {
@@ -428,9 +435,13 @@ class PaymentLimitsManager {
         return result;
     }
 
-    confirmedByPeriod() {
+    // Сохранённые строки месяца по категориям и периодам.
+    // excludeRegistryId — исключить партию (загрузку), данные которой уже показаны в превью.
+    confirmedByPeriod(excludeRegistryId = null) {
         const result = {};
+        const exclude = excludeRegistryId != null ? Number(excludeRegistryId) : null;
         this.confirmedRows.forEach(r => {
+            if (exclude !== null && Number(r.registry_id) === exclude) return;
             const cat = this.normalizeCategory(r.article);
             if (!cat) return;
             if (!result[cat]) result[cat] = { 1: 0, 2: 0, 3: 0, 4: 0 };
@@ -717,9 +728,11 @@ class PaymentLimitsManager {
                 return { success: false, message: result.error || 'Не удалось получить состояние реестра' };
             }
             this.registries = result.registries || [];
-            this.registry = this.registries.find(r => Number(r.period) === Number(this.getLoadPeriod()))
-                || this.registries[this.registries.length - 1]
-                || null;
+            // Последняя сохранённая загрузка (партия) периода — её и восстанавливаем
+            const forPeriod = this.registries.filter(r => Number(r.period) === Number(this.getLoadPeriod()));
+            this.registry = forPeriod.length
+                ? forPeriod[forPeriod.length - 1]
+                : (this.registries[this.registries.length - 1] || null);
             return { success: true, registry: this.registry, registries: this.registries };
         } catch (error) {
             console.warn('Не удалось получить состояние реестра лимитов:', error);
@@ -742,8 +755,12 @@ class PaymentLimitsManager {
             const fileName = this.fileNameFromResponse(response) || this.registry.file_name || 'registry.xlsx';
             const file = this.blobToFile(blob, fileName);
 
+            // loadExcelFile считает любую загрузку новой партией, поэтому сохраняем
+            // и восстанавливаем выбранный сохранённый реестр после чтения файла.
+            const reg = this.registry;
             const loaded = await this.loadExcelFile(file);
             if (!loaded.success) return loaded;
+            this.registry = reg;
 
             // Файл уже сохранён в БД — повторно загружать его не нужно
             this.sourceFile = null;
@@ -774,21 +791,6 @@ class PaymentLimitsManager {
         }
     }
 
-    // Если вручную загружен тот же самый файл, что уже сохранён за месяц (совпали имя и размер),
-    // считаем его сохранённым вариантом: применяем сохранённые отметки и не суммируем с БД
-    adoptRegistryIfSameFile(file) {
-        const reg = this.registry;
-        if (!reg || !reg.has_file || !file) return false;
-        const sameName = String(reg.file_name || '') !== '' && String(reg.file_name) === String(this.fileName || '');
-        const sameSize = Number(reg.file_size || 0) > 0 && Number(file.size || 0) === Number(reg.file_size);
-        if (!sameName || !sameSize) return false;
-        const stage = this.savedStage();
-        const removedRows = stage === 'final' ? reg.final_removed_rows : reg.draft_removed_rows;
-        this.applyRemovedRows(removedRows);
-        this.previewIsSavedCopy = true;
-        return true;
-    }
-
     blobToFile(blob, fileName) {
         try {
             return new File([blob], fileName, {
@@ -817,7 +819,9 @@ class PaymentLimitsManager {
         if (this.registry.final_saved_at) parts.push(`финал сохранён ${fmt(this.registry.final_saved_at)}`);
         if (!parts.length) return 'нет сохранённых данных';
         const dirty = this.localDirty ? ' · есть несохранённые правки' : '';
-        return `${parts.join(' · ')} · P${this.registry.period}${dirty}`;
+        const count = this.periodRegistriesCount();
+        const regs = count > 1 ? ` · загрузок в периоде: ${count}` : '';
+        return `${parts.join(' · ')} · ${this.periodLabel(this.registry.period)}${regs}${dirty}`;
     }
 
     // Обнуление ранее загруженных данных месяца (черновик, финал, платежи и исходный файл)
@@ -1127,30 +1131,51 @@ class PaymentLimitsManager {
         return this.previewIsSavedCopy && this.previewRows.length > 0;
     }
 
-    // Периоды из БД: в режиме открытого сохранённого варианта не учитываются
-    dbByPeriod() {
-        return this.isSavedCopyMode() ? {} : this.confirmedByPeriod();
+    // Текущая сохранённая загрузка (партия), данные которой показаны в превью
+    savedRegistryId() {
+        return this.registry ? Number(this.registry.id) : null;
     }
 
-    // Строки из БД для детальных блоков (пусто в режиме открытого сохранённого варианта)
+    // Сколько загрузок (партий) сохранено в текущем периоде
+    periodRegistriesCount() {
+        return (this.registries || [])
+            .filter(r => Number(r.period) === Number(this.getLoadPeriod()))
+            .length;
+    }
+
+    // Периоды из БД: в режиме открытого сохранённого варианта его партия исключается
+    // (её данные показаны в превью), а остальные сохранённые загрузки периода суммируются
+    dbByPeriod() {
+        const exclude = this.isSavedCopyMode() ? this.savedRegistryId() : null;
+        return this.confirmedByPeriod(exclude);
+    }
+
+    // Строки из БД для детальных блоков (без партии, открытой в превью)
     dbRows() {
-        return this.isSavedCopyMode() ? [] : this.confirmedRows;
+        if (!this.isSavedCopyMode()) return this.confirmedRows;
+        const exclude = this.savedRegistryId();
+        if (exclude === null) return this.confirmedRows;
+        return this.confirmedRows.filter(r => Number(r.registry_id) !== exclude);
     }
 
     // Подпись режима для заголовков блоков
     modeNote() {
         if (!this.isSavedCopyMode()) return '';
-        return ` · открыт ${this.savedStage() === 'final' ? 'финальный вариант' : 'черновик'} (данные не суммируются)`;
+        const stage = this.savedStage() === 'final' ? 'финальный вариант' : 'черновик';
+        const count = this.periodRegistriesCount();
+        return ` · открыта сохранённая загрузка (${stage})`
+            + (count > 1 ? `; в периоде сохранено загрузок: ${count}` : '');
     }
 
     // Подпись под суммой в ячейке
     cellMetaText(confirmedRub, previewRub, pctText) {
         if (this.isSavedCopyMode()) {
-            const stage = this.savedStage() === 'final' ? 'финальный вариант' : 'черновик';
             const note = this.localDirty ? ' · есть несохранённые правки' : '';
-            return `${stage}: ${this.fmtMoney((confirmedRub || 0) + (previewRub || 0))}${note} · ${pctText}`;
+            return `другие загрузки ${this.fmtMoney(confirmedRub || 0)} · эта загрузка `
+                + `${this.fmtMoney(previewRub || 0)}${note} · ${pctText}`;
         }
-        return `БД ${this.fmtMoney(confirmedRub || 0)} · Превью ${this.fmtMoney(previewRub || 0)} · ${pctText}`;
+        return `сохранено ${this.fmtMoney(confirmedRub || 0)} (все загрузки) · `
+            + `добавка ${this.fmtMoney(previewRub || 0)} · ${pctText}`;
     }
     cellHtml(confirmedRub, previewRub, limitRub) {
         const total = (confirmedRub || 0) + (previewRub || 0);
