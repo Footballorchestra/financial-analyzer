@@ -16,6 +16,8 @@ venv/
 .env
 .env.local
 *.env.*
+# Шаблон переменных окружения — без секретов, должен быть в репозитории
+!.env.example
 
 # Editors
 .vscode/

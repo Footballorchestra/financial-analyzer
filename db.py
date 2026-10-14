@@ -16,14 +16,56 @@ import os
 logger = logging.getLogger('financial_analyzer.db')
 
 # ============================================================
-# НАСТРОЙКИ ПОДКЛЮЧЕНИЯ (из переменных окружения с fallback)
+# ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ .env
+# ============================================================
+def _load_dotenv(path):
+    """
+    Загружает переменные окружения из файла .env.
+
+    Реализовано без внешних зависимостей (проект не использует python-dotenv).
+    Уже заданные переменные окружения НЕ перезаписываются: значения из systemd
+    и оболочки имеют приоритет над файлом. Поддерживается формат KEY=VALUE,
+    комментарии (#), пустые строки и значения в кавычках.
+
+    @param path: Абсолютный путь к файлу .env.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('export '):
+                    line = line[len('export '):].strip()
+                key, sep, value = line.partition('=')
+                if not sep:
+                    continue
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass  # .env необязателен: значения могут прийти из окружения
+    except OSError as e:
+        logger.warning(f"Не удалось прочитать {path}: {e}")
+
+
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+_load_dotenv(_ENV_PATH)
+
+# ============================================================
+# НАСТРОЙКИ ПОДКЛЮЧЕНИЯ (из переменных окружения / .env)
 # ============================================================
 DB_CONFIG = {
     'host': os.environ.get('DB_HOST', '127.0.0.1'),
     'port': int(os.environ.get('DB_PORT', 5432)),
     'database': os.environ.get('DB_NAME', 'financial_analyzer'),
     'user': os.environ.get('DB_USER', 'postgres'),
-    'password': os.environ.get('DB_PASSWORD', 'Kapapa661109'),
+    # Пароль хранится только в .env / переменных окружения (см. .env.example).
+    # Значения по умолчанию нет намеренно — секрет не должен попадать в репозиторий.
+    'password': os.environ.get('DB_PASSWORD'),
     'connect_timeout': int(os.environ.get('DB_CONNECT_TIMEOUT', 5)),
 }
 
@@ -36,6 +78,14 @@ def _init_pool():
     """Инициализирует пул соединений (вызывается один раз)."""
     global _pool
     if _pool is None:
+        if not DB_CONFIG.get('password'):
+            message = (
+                "Не задан пароль БД: переменная окружения DB_PASSWORD пуста. "
+                "Заполните файл .env (см. .env.example) или задайте DB_PASSWORD "
+                "в переменных окружения."
+            )
+            logger.critical(message)
+            raise RuntimeError(message)
         try:
             _pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=int(os.environ.get('DB_POOL_MIN', 2)),
