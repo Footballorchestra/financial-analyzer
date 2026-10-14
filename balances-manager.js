@@ -38,6 +38,17 @@ class BalancesManager {
         document.getElementById('totalAccountsCount').textContent = visibleCount;
     }
 
+    // Режим «только проценты по длинным депозитам» — галочка на странице остатков
+    // (включена по умолчанию).
+    // Длинный (срочный) депозит — депозит с endDate: вносится через форму и
+    // подсвечивается в таблице. Обычный депозит — без endDate: загружается из Excel.
+    // Когда галочка включена, тело длинных депозитов не показывается и не прибавляется
+    // к остаткам (учитываются только их проценты), а обычные депозиты — целиком (тело + проценты).
+    isInterestOnlyMode() {
+        const checkbox = document.getElementById('depositsInterestOnly');
+        return checkbox ? checkbox.checked : true; // по умолчанию — включено
+    }
+
     updateTable() {
         const accounts = this.storage.getAccounts();
         const accountNumbers = Object.keys(accounts);
@@ -47,6 +58,7 @@ class BalancesManager {
             return;
         }
 
+        const interestOnly = this.isInterestOnlyMode();
         let html = '', totalBalance = 0, totalDeposit = 0, totalInterest = 0;
         accountNumbers.forEach(accountNumber => {
             const account = accounts[accountNumber];
@@ -56,12 +68,23 @@ class BalancesManager {
             const rawDate = new Date().toISOString().split('T')[0];
             const statementDate = rawDate.split('-').reverse().join('.');
 
-            const result = this.calculateInterestAndRealBalance(accountNumber, balance, deposits);
-            const { realBalance, unlockedAmount, unlockedInterest, isFrozen } = result;
+            const result = this.calculateInterestAndRealBalance(accountNumber, balance, deposits, interestOnly);
+            const { realBalance, unlockedAmount, unlockedInterest, regularAmount, isFrozen } = result;
+
+            // В режиме «только проценты по длинным депозитам» тело длинных (срочных)
+            // депозитов не показываем — остаётся тело обычных депозитов (Excel).
+            // unlockedAmount остаётся «сырым» — нужен для подсказки о заморозке.
+            const depositBodyShown = interestOnly ? regularAmount : unlockedAmount;
+            // Начисленные проценты в обоих режимах — по обычным и «вернувшимся» депозитам;
+            // проценты ещё замороженных (не вернувшихся) длинных депозитов не начисляются.
+            const interestShown = unlockedInterest;
 
             const balanceFormatted = this.storage.formatNumber(balance);
-            const depositFormatted = unlockedAmount > 0 ? this.storage.formatNumber(unlockedAmount) : '';
-            const interestFormatted = unlockedInterest > 0 ? this.storage.formatNumber(unlockedInterest) : '';
+            const depositFormatted = depositBodyShown > 0 ? this.storage.formatNumber(depositBodyShown) : '';
+            const depositTitle = interestOnly
+                ? ' title="Режим «Только проценты»: тело длинных (срочных) депозитов не показывается и не учитывается в остатках"'
+                : '';
+            const interestFormatted = interestShown > 0 ? this.storage.formatNumber(interestShown) : '';
             const realBalanceFormatted = this.storage.formatNumber(realBalance);
 
             const calcDate = document.getElementById('calculationDate').value;
@@ -73,8 +96,8 @@ class BalancesManager {
             const rateDisplay = unlockedDeposits.length > 0 ? unlockedDeposits.map(d => d.rate || 0).join('% / ') + '%' : '';
 
             totalBalance += balance;
-            totalDeposit += unlockedAmount;
-            totalInterest += unlockedInterest;
+            totalDeposit += depositBodyShown;
+            totalInterest += interestShown;
 
             const frozenClass = isFrozen ? ' class="deposit-frozen"' : '';
             let frozenTitle = '';
@@ -85,15 +108,22 @@ class BalancesManager {
                 if (frozenDep) frozenTitle = ` title="Заморожен срочный депозит на ${this.storage.formatNumber(frozenSum)} ₽ до ${frozenDep.endDate}"`;
             }
 
-            html += `<tr${frozenClass}${frozenTitle}><td>${account.company || ''}</td><td>${account.bank || ''}</td><td>${accountNumber}</td><td class="number-cell">${balanceFormatted}</td><td class="number-cell editable" data-account="${accountNumber}" data-field="amount">${depositFormatted}</td><td class="number-cell editable" data-account="${accountNumber}" data-field="rate">${rateDisplay}</td><td class="number-cell">${interestFormatted}</td><td class="number-cell">${realBalanceFormatted}</td><td>${statementDate}</td></tr>`;
+            html += `<tr${frozenClass}${frozenTitle}><td>${account.company || ''}</td><td>${account.bank || ''}</td><td>${accountNumber}</td><td class="number-cell">${balanceFormatted}</td><td class="number-cell editable" data-account="${accountNumber}" data-field="amount"${depositTitle}>${depositFormatted}</td><td class="number-cell editable" data-account="${accountNumber}" data-field="rate">${rateDisplay}</td><td class="number-cell">${interestFormatted}</td><td class="number-cell">${realBalanceFormatted}</td><td>${statementDate}</td></tr>`;
         });
 
         tbody.innerHTML = html;
         this.updateSummary(totalBalance, totalDeposit, totalInterest, accountNumbers.length);
     }
 
-    calculateInterestAndRealBalance(accountNumber, balance, deposits) {
-        const result = { interest: 0, realBalance: balance, isFrozen: false, unlockedAmount: 0, unlockedInterest: 0 };
+    calculateInterestAndRealBalance(accountNumber, balance, deposits, interestOnly = false) {
+        const result = {
+            interest: 0,          // начисленные проценты по всем действующим депозитам
+            realBalance: balance,
+            isFrozen: false,
+            unlockedAmount: 0,    // тело «вернувшихся»/бессрочных депозитов (нужно для подсказки о заморозке)
+            unlockedInterest: 0,  // проценты по «вернувшихся»/бессрочным депозитам
+            regularAmount: 0      // тело обычных депозитов (без endDate — загружаются из Excel)
+        };
         if (!Array.isArray(deposits) || deposits.length === 0) return result;
 
         const calculationDate = document.getElementById('calculationDate').value;
@@ -102,11 +132,19 @@ class BalancesManager {
         const mibAccounts = ['40702810700990012381', '40702810100990012143'];
         const isMib = mibAccounts.includes(accountNumber);
 
-        let totalInterest = 0, unlockedBody = 0, unlockedInt = 0, hasFrozen = false, anyDepositActive = false;
+        let totalInterest = 0, unlockedBody = 0, unlockedInt = 0, regularBody = 0;
+        let hasFrozen = false, anyDepositActive = false;
 
         deposits.forEach(dep => {
             const amount = dep.amount || 0, rate = dep.rate || 0, startDate = dep.startDate || '', endDate = dep.endDate || null;
             if (amount <= 0) return;
+
+            // Обычный депозит (без endDate) приходит из Excel-файла — его тело учитываем
+            // всегда, даже если дату начала не удалось определить и проценты не считаются.
+            // Длинный/срочный (с endDate) вносится через форму и подсвечивается в таблице.
+            if (!endDate) {
+                regularBody += amount;
+            }
 
             // Определяем заморозку до проверки days — депозит заморожен,
             // даже если расчётная дата ещё не достигла даты начала.
@@ -132,13 +170,33 @@ class BalancesManager {
         });
 
         result.isFrozen = hasFrozen;
+        // Тело обычных депозитов (Excel) учитывается и когда проценты посчитать нельзя
+        result.regularAmount = regularBody;
         if (!anyDepositActive) return result;
 
         result.interest = totalInterest;
         result.unlockedAmount = unlockedBody;
         result.unlockedInterest = unlockedInt;
-        result.realBalance = balance + unlockedBody + unlockedInt;
-        if (isMib) result.realBalance = balance + unlockedInt;
+        // Реальный остаток:
+        //  • счета МИБ (40702810700990012381, 40702810100990012143): особенность банка —
+        //    при размещении денег на депозит фактического списания не происходит, деньги
+        //    остаются на счёте, и к моменту «возврата» депозита они там уже есть. Поэтому
+        //    тело депозита (и обычного из Excel, и «вернувшегося» срочного) НЕ прибавляем —
+        //    иначе остаток задваивается. Учитываем только начисленные проценты.
+        //    Правило действует всегда и имеет приоритет над режимом «только проценты»;
+        //  • галочка «только проценты по длинным депозитам» включена (по умолчанию):
+        //    длинные (срочные) депозиты не участвуют в остатке ни телом, ни процентами,
+        //    пока депозит не вернулся (endDate >= расчётной даты). Обычные депозиты (Excel)
+        //    учитываются целиком — тело + проценты;
+        //  • галочка выключена: прежнее поведение — тело «вернувшихся»/бессрочных депозитов
+        //    и их проценты.
+        if (isMib) {
+            result.realBalance = balance + unlockedInt;
+        } else if (interestOnly) {
+            result.realBalance = balance + regularBody + unlockedInt;
+        } else {
+            result.realBalance = balance + unlockedBody + unlockedInt;
+        }
 
         return result;
     }
@@ -203,8 +261,10 @@ class BalancesManager {
             if (amount > 0 && rate > 0) updatedDeposits.push({ amount, rate, startDate, endDate: endDate || null });
         });
         this.storage.setDepositForAccount(this.editingAccount, updatedDeposits);
-        // Синхронизируем с БД
-        await this.storage.syncDepositsToServer();
+        // Синхронизируем с БД, явно передавая счёт: если в модальном окне удалили все
+        // депозиты счёта, он всё равно должен попасть в payload (с пустым списком),
+        // иначе запись в term_deposits останется и депозит вернётся после перезагрузки.
+        await this.storage.syncDepositsToServer([this.editingAccount]);
         document.getElementById('depositModal').classList.remove('active');
         this.editingAccount = null;
         this.editingDeposits = [];
@@ -294,29 +354,23 @@ class BalancesManager {
         }
     }
 
-    // Мержит депозит из Excel с существующими депозитами
-    // Обычные депозиты (без endDate) — суммируются, срочные — сохраняются
+    // Мержит депозит из Excel с существующими депозитами.
+    // Срочные (с endDate) сохраняются, обычный (без endDate) ЗАМЕНЯЕТСЯ данными из файла:
+    // файл — снимок текущих депозитов, поэтому повторная загрузка того же файла
+    // (в т.ч. после перезагрузки страницы, когда обычные депозиты восстанавливаются
+    // из localStorage) не должна суммировать суммы и удваивать остаток.
     mergeExcelDeposit(account, excelDeposit) {
         const existing = this.storage.getDepositForAccount(account);
         const termOnly = existing.filter(d => d.endDate); // сохраняем срочные
-        const regularExisting = existing.find(d => !d.endDate); // ищем существующий обычный депозит
+        const regularExisting = existing.find(d => !d.endDate); // уже известный обычный депозит
 
-        if (regularExisting) {
-            // Суммируем сумму существующего обычного депозита с новым
-            const totalAmount = (regularExisting.amount || 0) + (excelDeposit.amount || 0);
-            // Средневзвешенная ставка
-            const weightedRate = totalAmount > 0
-                ? ((regularExisting.amount || 0) * (regularExisting.rate || 0) + (excelDeposit.amount || 0) * (excelDeposit.rate || 0)) / totalAmount
-                : (excelDeposit.rate || 0);
-            termOnly.push({
-                amount: totalAmount,
-                rate: weightedRate,
-                startDate: regularExisting.startDate || excelDeposit.startDate || '',
-                endDate: null
-            });
-        } else {
-            termOnly.push({ ...excelDeposit, endDate: null });
-        }
+        termOnly.push({
+            amount: excelDeposit.amount || 0,
+            rate: excelDeposit.rate || 0,
+            // если в файле не оказалось даты начала — оставляем ранее известную
+            startDate: excelDeposit.startDate || (regularExisting ? regularExisting.startDate : '') || '',
+            endDate: null
+        });
 
         this.storage.setDepositForAccount(account, termOnly);
     }
@@ -469,6 +523,7 @@ class BalancesManager {
             sorted.sort((a, b) => { const ia = order.indexOf(a), ib = order.indexOf(b); if (ia !== -1 && ib !== -1) return ia - ib; if (ia !== -1) return -1; if (ib !== -1) return 1; return a.localeCompare(b); });
         } catch (e) {}
 
+        const interestOnly = this.isInterestOnlyMode();
         const data = [['Компания', 'Банк', 'Счёт', 'Остаток по выписке', 'Вернувшийся депозит', 'Начисленные проценты', 'Реальный остаток', 'Дата']];
         let totalBalance = 0, totalDeposit = 0, totalInterest = 0, totalRealBalance = 0;
 
@@ -479,9 +534,12 @@ class BalancesManager {
             const balance = latestStatement?.balance || account?.balance || 0;
             const rawDate = new Date().toISOString().split('T')[0];
             const statementDate = rawDate.split('-').reverse().join('.');
-            const { realBalance, unlockedAmount, unlockedInterest } = this.calculateInterestAndRealBalance(accountNumber, balance, deposits);
-            data.push([account.company || '', account.bank || '', accountNumber, balance, unlockedAmount, unlockedInterest, realBalance, statementDate]);
-            totalBalance += balance; totalDeposit += unlockedAmount; totalInterest += unlockedInterest; totalRealBalance += realBalance;
+            const { realBalance, unlockedAmount, unlockedInterest, regularAmount } = this.calculateInterestAndRealBalance(accountNumber, balance, deposits, interestOnly);
+            // В режиме «только проценты по длинным депозитам» в выгрузку не попадает тело длинных депозитов
+            const depositBodyShown = interestOnly ? regularAmount : unlockedAmount;
+            const interestShown = unlockedInterest;
+            data.push([account.company || '', account.bank || '', accountNumber, balance, depositBodyShown, interestShown, realBalance, statementDate]);
+            totalBalance += balance; totalDeposit += depositBodyShown; totalInterest += interestShown; totalRealBalance += realBalance;
         });
 
         data.push(['ИТОГО', '', '', totalBalance, totalDeposit, totalInterest, totalRealBalance, '']);

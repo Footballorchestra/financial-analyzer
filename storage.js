@@ -15,6 +15,9 @@ class StorageManager {
     // Асинхронная инициализация депозитов (вызывается из App.init())
     async initDeposits() {
         this.depositData = await this.loadDepositsFromServer();
+        // Срочные (длинные) депозиты приходят из БД, обычные (без endDate, из Excel) —
+        // их в БД нет (end_date NOT NULL), поэтому возвращаем их из localStorage.
+        this.restoreRegularDeposits();
         await this.cleanExpiredDeposits();
     }
 
@@ -75,16 +78,69 @@ class StorageManager {
     setDepositForAccount(account, data) {
         // data может быть массивом или объектом (обратная совместимость)
         this.depositData[account] = Array.isArray(data) ? data : [data];
+        this.saveRegularDepositsToLocal();
+    }
+
+    // ── Обычные депозиты (без endDate, загружаются из Excel) ────────────────
+    // В БД они не сохраняются: у term_deposits поле end_date NOT NULL, а API
+    // синхронизации отправляет только срочные (getDepositForAccount().filter(d => d.endDate)).
+    // Поэтому держим их в localStorage, иначе после перезагрузки страницы они
+    // пропадают из остатков (тело и проценты обычного депозита перестают учитываться).
+    saveRegularDepositsToLocal() {
+        try {
+            const regular = {};
+            Object.entries(this.depositData).forEach(([account, deposits]) => {
+                const list = (Array.isArray(deposits) ? deposits : [deposits])
+                    .filter(d => d && !d.endDate && (d.amount || 0) > 0);
+                if (list.length > 0) regular[account] = list;
+            });
+            localStorage.setItem('regularDeposits', JSON.stringify(regular));
+        } catch (e) {
+            console.warn('Не удалось сохранить обычные депозиты в localStorage:', e);
+        }
+    }
+
+    loadRegularDepositsFromLocal() {
+        try {
+            const stored = localStorage.getItem('regularDeposits');
+            return stored ? JSON.parse(stored) : {};
+        } catch (e) {
+            console.warn('Не удалось прочитать обычные депозиты из localStorage:', e);
+            return {};
+        }
+    }
+
+    // Возвращает обычные депозиты в состояние после загрузки срочных из БД
+    restoreRegularDeposits() {
+        const regular = this.loadRegularDepositsFromLocal();
+        let restored = 0;
+        Object.entries(regular).forEach(([account, list]) => {
+            if (!Array.isArray(list) || list.length === 0) return;
+            // срочные из БД сохраняем, обычные подставляем из localStorage
+            const longTerm = this.getDepositForAccount(account).filter(d => d && d.endDate);
+            this.depositData[account] = [...longTerm, ...list];
+            restored += list.length;
+        });
+        if (restored > 0) {
+            console.log(`Восстановлены обычные депозиты из localStorage: ${restored} записей на ${Object.keys(regular).length} счетах`);
+        }
     }
 
     // Сохранение срочных депозитов в БД через API (с fallback на localStorage)
-    async syncDepositsToServer() {
-        // Собираем только срочные депозиты (с датой окончания)
+    // accountsToSync — счета, которых уже нет в локальном depositData,
+    // но состояние которых всё равно надо записать в БД (например, счета,
+    // полностью очищенные автоочисткой истекших депозитов).
+    async syncDepositsToServer(accountsToSync = []) {
+        // Собираем срочные депозиты (с датой окончания) по всем счетам локального состояния.
+        // ВАЖНО: счёт попадает в payload даже с пустым массивом. Бэкенд
+        // (db.sync_term_deposits) удаляет записи только по счетам из payload, поэтому
+        // без этого удаление последнего срочного депозита не сохранилось бы в БД,
+        // и депозит «воскресал» бы при следующем открытии программы.
+        const accounts = new Set([...Object.keys(this.depositData), ...accountsToSync.filter(Boolean)]);
         const termDeposits = {};
-        Object.entries(this.depositData).forEach(([account, deposits]) => {
-            if (!Array.isArray(deposits)) return;
-            const termOnly = deposits.filter(d => d.endDate);
-            if (termOnly.length > 0) termDeposits[account] = termOnly;
+        accounts.forEach(account => {
+            // getDepositForAccount нормализует старый формат {amount, rate, startDate} в массив
+            termDeposits[account] = this.getDepositForAccount(account).filter(d => d && d.endDate);
         });
 
         const accountCount = Object.keys(termDeposits).length;
@@ -159,21 +215,30 @@ class StorageManager {
     async cleanExpiredDeposits() {
         const today = new Date().toISOString().split('T')[0];
         let cleaned = 0;
+        const clearedAccounts = []; // счета, у которых не осталось ни одного депозита
 
         Object.entries(this.depositData).forEach(([account, deposits]) => {
-            if (!Array.isArray(deposits)) return;
+            const list = Array.isArray(deposits) ? deposits : [deposits];
             // endDate — последний день действия, today > endDate означает что депозит истёк
-            const active = deposits.filter(d => !d.endDate || d.endDate >= today);
-            if (active.length !== deposits.length) {
-                cleaned += deposits.length - active.length;
-                if (active.length > 0) this.depositData[account] = active;
-                else delete this.depositData[account];
+            const active = list.filter(d => !d.endDate || d.endDate >= today);
+            if (active.length !== list.length) {
+                cleaned += list.length - active.length;
+                if (active.length > 0) {
+                    this.depositData[account] = active;
+                } else {
+                    delete this.depositData[account];
+                    clearedAccounts.push(account);
+                }
             }
         });
 
         if (cleaned > 0) {
             console.log(`Автоочистка: удалено ${cleaned} истекших депозитов`);
-            await this.syncDepositsToServer();
+            // Очищенные счета передаём явно: из depositData они уже удалены,
+            // но их записи в БД тоже надо удалить.
+            await this.syncDepositsToServer(clearedAccounts);
+            // держим localStorage с обычными депозитами в актуальном состоянии
+            this.saveRegularDepositsToLocal();
         }
     }
     getExclusionRules() { return [...this.exclusionRules]; }

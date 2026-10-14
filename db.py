@@ -6,6 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import json
 import logging
+import re
 import time
 import os
 
@@ -2147,6 +2148,7 @@ CREATE INDEX IF NOT EXISTS idx_plp_registry ON payment_limits_payments(registry_
 
 # Реестр загрузки: исходный файл + снятые чекбоксами строки для каждой стадии.
 # Нужен, чтобы финальный файл можно было выгрузить с любого компьютера и после перезапуска.
+# row_edits — правки «Тип оплаты» и «Детальный лимит» по строкам файла (ключ — номер строки Excel).
 _PLP_REGISTRY_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS payment_limits_registry (
     id SERIAL PRIMARY KEY,
@@ -2163,6 +2165,8 @@ CREATE TABLE IF NOT EXISTS payment_limits_registry (
     final_saved_at TIMESTAMP,
     final_author VARCHAR(255) DEFAULT '',
     final_exported_at TIMESTAMP,
+    draft_row_edits JSONB DEFAULT '{}'::jsonb,
+    final_row_edits JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -2175,6 +2179,23 @@ CREATE TABLE IF NOT EXISTS payment_limits_config (
     id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     config JSONB NOT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# Постоянный справочник: к какой категории лимита и подстатье отнесён контрагент.
+# Наполняется при каждом сохранении варианта и НЕ удаляется вместе с месячными данными,
+# поэтому при следующей загрузке категории подставляются автоматически.
+_PLP_CC_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS payment_limits_contractor_categories (
+    id SERIAL PRIMARY KEY,
+    name_key VARCHAR(500) NOT NULL UNIQUE,
+    recipient VARCHAR(500) NOT NULL DEFAULT '',
+    article VARCHAR(255) NOT NULL DEFAULT '',
+    detail_limit VARCHAR(255) NOT NULL DEFAULT '',
+    uses_count INTEGER NOT NULL DEFAULT 1,
+    source VARCHAR(20) NOT NULL DEFAULT 'save',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -2236,9 +2257,10 @@ def _ensure_plp_schema(conn):
         cur.execute(
             "SELECT to_regclass('public.payment_limits_payments'), "
             "to_regclass('public.payment_limits_config'), "
-            "to_regclass('public.payment_limits_registry')"
+            "to_regclass('public.payment_limits_registry'), "
+            "to_regclass('public.payment_limits_contractor_categories')"
         )
-        payments_exists, config_exists, registry_exists = cur.fetchone()
+        payments_exists, config_exists, registry_exists, cc_exists = cur.fetchone()
         if payments_exists is None:
             cur.execute(_PLP_CREATE_SQL)
             logger.info("Создана таблица payment_limits_payments (контроль лимитов платежей)")
@@ -2273,6 +2295,15 @@ def _ensure_plp_schema(conn):
                 "ALTER TABLE payment_limits_registry "
                 "ADD COLUMN IF NOT EXISTS final_exported_at TIMESTAMP"
             )
+            # Правки «Тип оплаты» и «Детальный лимит» по строкам файла (ключ — номер строки Excel)
+            cur.execute(
+                "ALTER TABLE payment_limits_registry "
+                "ADD COLUMN IF NOT EXISTS draft_row_edits JSONB DEFAULT '{}'::jsonb"
+            )
+            cur.execute(
+                "ALTER TABLE payment_limits_registry "
+                "ADD COLUMN IF NOT EXISTS final_row_edits JSONB DEFAULT '{}'::jsonb"
+            )
             # В периоде может быть несколько сохранённых загрузок (партий):
             # снимаем уникальность (limit_month, period) для накопления сумм
             cur.execute(
@@ -2294,12 +2325,20 @@ def _ensure_plp_schema(conn):
                    AND p.period = r.period
                 """
             )
+        if cc_exists is None:
+            cur.execute(_PLP_CC_CREATE_SQL)
+            logger.info("Создан справочник соответствия контрагентов категориям лимитов")
         conn.commit()
         cur.close()
     except Exception as e:
         logger.error(f"Не удалось проверить/создать таблицы контроля лимитов: {e}")
         return
     _PLP_SCHEMA_APPLIED = True
+    # Первый раз наполняем справочник по уже сохранённым платежам (месячные данные не трогаем)
+    try:
+        backfill_contractor_categories()
+    except Exception as e:
+        logger.warning(f"Не удалось наполнить справочник контрагентов: {e}")
 
 
 def ensure_payment_limits_schema():
@@ -2532,9 +2571,13 @@ def save_payment_limits_stage(month, period, stage, payments, registry_id=None):
             )
         conn.commit()
         cur.close()
+        # Запоминаем, к каким категориям отнесены контрагенты — пригодится в следующих загрузках
+        learned = save_contractor_categories(payments)
         logger.info(f"Сохранён вариант «{stage}» лимитов: месяц {month_val}, P{period_val}, "
-                    f"загрузка #{registry_val}, {len(rows)} строк (заменено {replaced})")
-        return {'success': True, 'count': len(rows), 'replaced': replaced}
+                    f"загрузка #{registry_val}, {len(rows)} строк (заменено {replaced}), "
+                    f"контрагентов в справочнике обновлено: {learned}")
+        return {'success': True, 'count': len(rows), 'replaced': replaced,
+                'contractors_learned': learned}
     except Exception as e:
         logger.error(f"Ошибка сохранения варианта «{stage}» лимитов: {e}", exc_info=True)
         if conn:
@@ -2548,12 +2591,180 @@ def save_payment_limits_stage(month, period, stage, payments, registry_id=None):
             return_connection(conn)
 
 
+# ---------------- Справочник «контрагент → категория лимита и подстатья» ----------------
+# Нужен, чтобы при загрузке нового файла категории подставлялись автоматически:
+# если контрагент уже встречался и был отнесён к категории, берём её из справочника.
+
+def _plp_contractor_key(name):
+    """Ключ контрагента: регистр и лишние пробелы не важны (как на экране)."""
+    if not name:
+        return ''
+    return re.sub(r'\s+', ' ', str(name)).strip().upper()
+
+
+def save_contractor_categories(payments, source='save'):
+    """
+    Запоминает, к какой категории лимита и подстатье отнесён контрагент.
+
+    Вызывается при сохранении варианта: последнее сохранение важнее прежнего.
+    Строки без категории (ещё не назначены) справочник не портят.
+
+    Returns:
+        int — сколько контрагентов обновлено
+    """
+    unique = {}
+    for p in payments or []:
+        key = _plp_contractor_key(p.get('recipient'))
+        article = (p.get('article') or '').strip()
+        if not key or not article:
+            continue
+        unique[key] = (key, str(p.get('recipient') or '').strip(),
+                       article, (p.get('detail_limit') or '').strip(), source)
+    if not unique:
+        return 0
+
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO payment_limits_contractor_categories
+                (name_key, recipient, article, detail_limit, source, uses_count)
+            VALUES %s
+            ON CONFLICT (name_key) DO UPDATE
+               SET recipient = EXCLUDED.recipient,
+                   article = EXCLUDED.article,
+                   detail_limit = EXCLUDED.detail_limit,
+                   source = EXCLUDED.source,
+                   uses_count = payment_limits_contractor_categories.uses_count + 1,
+                   updated_at = CURRENT_TIMESTAMP
+            """,
+            list(unique.values()),
+            template="(%s, %s, %s, %s, %s, 1)"
+        )
+        conn.commit()
+        cur.close()
+        return len(unique)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения справочника контрагентов: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return 0
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def backfill_contractor_categories():
+    """
+    Одноразовое наполнение справочника по уже сохранённым платежам.
+
+    Приоритет: подтверждённые (final) строки и более поздние по времени.
+    Уже известные контрагенты не перезаписываются.
+
+    Returns:
+        int — сколько контрагентов добавлено/обработано
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT recipient, article, detail_limit
+              FROM payment_limits_payments
+             WHERE btrim(recipient) <> '' AND btrim(article) <> ''
+             ORDER BY (stage = 'final') DESC, confirmed_at DESC, id DESC
+            """
+        )
+        unique = {}
+        for recipient, article, detail_limit in cur.fetchall():
+            key = _plp_contractor_key(recipient)
+            if key and key not in unique:
+                unique[key] = (key, (recipient or '').strip(), (article or '').strip(),
+                               (detail_limit or '').strip(), 'history')
+        if unique:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO payment_limits_contractor_categories
+                    (name_key, recipient, article, detail_limit, source, uses_count)
+                VALUES %s
+                ON CONFLICT (name_key) DO NOTHING
+                """,
+                list(unique.values()),
+                template="(%s, %s, %s, %s, %s, 1)"
+            )
+        conn.commit()
+        cur.close()
+        if unique:
+            logger.info(f"Справочник контрагентов: заполнено по истории — {len(unique)} контрагентов")
+        return len(unique)
+    except Exception as e:
+        logger.error(f"Ошибка наполнения справочника контрагентов: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return 0
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_contractor_categories():
+    """
+    Справочник «контрагент → тип оплаты и детальный лимит» для автоматической подстановки.
+
+    Returns:
+        dict — {'НАИМЕНОВАНИЕ': {'category': ..., 'detail': ..., 'uses': N, 'updated_at': ...}}
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        _ensure_plp_schema(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT name_key, article, detail_limit, uses_count, updated_at
+              FROM payment_limits_contractor_categories
+             WHERE btrim(article) <> ''
+             ORDER BY name_key
+            """
+        )
+        result = {}
+        for name_key, article, detail_limit, uses_count, updated_at in cur.fetchall():
+            result[name_key] = {
+                'category': article or '',
+                'detail': detail_limit or '',
+                'uses': int(uses_count or 0),
+                'updated_at': updated_at.isoformat(timespec='seconds') if updated_at else None,
+            }
+        cur.close()
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка чтения справочника контрагентов: {e}")
+        return {}
+    finally:
+        if conn:
+            return_connection(conn)
+
+
 # ---------------- Реестр загрузок (исходный файл + снятые строки) ----------------
 
 _PLP_REGISTRY_META_SQL = """
 SELECT id, limit_month, period, file_name, sheet_name, row_count,
        draft_removed_rows, draft_saved_at, draft_author,
        final_removed_rows, final_saved_at, final_author, final_exported_at,
+       COALESCE(draft_row_edits, '{}'::jsonb) AS draft_row_edits,
+       COALESCE(final_row_edits, '{}'::jsonb) AS final_row_edits,
        created_at, updated_at,
        (file_bytes IS NOT NULL) AS has_file,
        COALESCE(OCTET_LENGTH(file_bytes), 0) AS file_size
@@ -2563,10 +2774,13 @@ SELECT id, limit_month, period, file_name, sheet_name, row_count,
 
 def save_payment_limits_registry(month, period, stage, file_name=None, sheet_name=None,
                                  file_bytes=None, row_count=None, removed_rows=None, author='',
-                                 registry_id=None):
+                                 registry_id=None, row_edits=None):
     """
     Сохраняет/обновляет реестр загрузки (партию) месяца + периода:
     исходный файл (один раз на загрузку) и набор снятых чекбоксами строк для указанной стадии.
+    Дополнительно сохраняются правки «Тип оплаты» и «Детальный лимит» по строкам файла
+    (row_edits: {«номер строки Excel»: {category, detail}}) — чтобы после перезагрузки
+    страницы или на другом компьютере правки не потерялись.
 
     Если registry_id не задан — создаётся НОВАЯ загрузка (партия): так внутри одного периода
     накапливаются все сохранённые реестры.
@@ -2582,6 +2796,8 @@ def save_payment_limits_registry(month, period, stage, file_name=None, sheet_nam
         month_val = _PLP_MONTH(month)
         period_val = int(period)
         removed_json = json.dumps(sorted({int(r) for r in (removed_rows or [])}))
+        edits_json = json.dumps(row_edits if isinstance(row_edits, dict) else {},
+                                ensure_ascii=False, sort_keys=True)
         created = False
 
         reg_id = int(registry_id) if registry_id else None
@@ -2620,31 +2836,35 @@ def save_payment_limits_registry(month, period, stage, file_name=None, sheet_nam
                 """
                 UPDATE payment_limits_registry
                    SET draft_removed_rows = %s::jsonb,
+                       draft_row_edits = %s::jsonb,
                        draft_saved_at = CURRENT_TIMESTAMP,
                        draft_author = %s,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = %s
                 """,
-                (removed_json, author or '', reg_id)
+                (removed_json, edits_json, author or '', reg_id)
             )
         else:
             cur.execute(
                 """
                 UPDATE payment_limits_registry
                    SET final_removed_rows = %s::jsonb,
+                       final_row_edits = %s::jsonb,
                        final_saved_at = CURRENT_TIMESTAMP,
                        final_author = %s,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = %s
                 """,
-                (removed_json, author or '', reg_id)
+                (removed_json, edits_json, author or '', reg_id)
             )
 
         conn.commit()
         cur.close()
         logger.info(f"Реестр лимитов сохранён: месяц {month_val}, P{period_val}, загрузка #{reg_id}"
                     f"{' (новая)' if created else ''}, стадия «{stage}», "
-                    f"снято строк {len(json.loads(removed_json))}, файл {'обновлён' if file_bytes else 'не менялся'}")
+                    f"снято строк {len(json.loads(removed_json))}, "
+                    f"правок категорий {len(json.loads(edits_json))}, "
+                    f"файл {'обновлён' if file_bytes else 'не менялся'}")
         return {'success': True, 'registry_id': reg_id, 'created': created}
     except Exception as e:
         logger.error(f"Ошибка сохранения реестра лимитов: {e}", exc_info=True)

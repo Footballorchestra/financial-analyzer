@@ -846,6 +846,24 @@ body {
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
+/* ── Остатки: режим «только проценты» ────────────────────── */
+.balances-interest-only {
+    margin-left: auto; /* прижать галочку к правому краю панели выбора даты */
+    padding: 4px 0;
+}
+
+.balances-interest-only span {
+    font-size: 13px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.balances-interest-only input[type="checkbox"] {
+    margin: 0;
+    accent-color: var(--primary);
+    cursor: pointer;
+}
+
 /* ── Таблицы ─────────────────────────────────────────────── */
 .table-container {
     border: 1px solid var(--border-light);
@@ -3120,28 +3138,30 @@ tr.recon-row-only_excel:hover {
 /* ============================================================
    КОНТРОЛЬ ЛИМИТОВ ПЛАТЕЖЕЙ ПОСТАВЩИКАМ (payment-limits)
    ============================================================ */
-.pl-header-info {
+/* Окно «Обнулить загруженное»: выбор периода */
+.pl-reset-field {
     display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
     align-items: center;
-    justify-content: flex-end;
+    gap: 10px;
+    margin: 6px 0 12px;
     font-size: 13px;
 }
 
-.pl-info-item {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: var(--bg-tertiary, #f1f5f9);
+.pl-reset-field select {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 10px;
+    font-size: 13px;
     border: 1px solid var(--border-medium, #e2e8f0);
     border-radius: 8px;
-    padding: 6px 10px;
-    white-space: nowrap;
+    background: var(--bg-primary, #ffffff);
+    color: var(--text-primary, #0f172a);
 }
 
-.pl-info-item i {
-    color: var(--accent, #2563eb);
+.pl-reset-note {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary, #475569);
 }
 
 .pl-upload-zone {
@@ -3389,14 +3409,63 @@ tr.recon-row-only_excel:hover {
 .pl-text-over { color: #dc2626 !important; font-weight: 700; }
 .pl-text-ok { color: #16a34a !important; font-weight: 700; }
 
-/* Таблица заявок превью */
+/* Таблица заявок превью.
+   Порядок столбцов задаётся в интерфейсе (см. previewRowsHtml) и отличается от порядка в файле —
+   на выгрузку Excel это не влияет: там используется исходный файл и номера его колонок.
+   Фиксированная раскладка и width: 100% гарантируют, что ключевые столбцы
+   (Сумма → Получатель → Статья движения ДС → Назначение платежа → Тип оплаты → Детальный лимит)
+   помещаются на экран без горизонтального скролла. */
 .pl-requests-table {
-    min-width: 1600px;
+    width: 100%;
+    min-width: 0;
+    table-layout: fixed;
 }
 
+.pl-requests-table th,
 .pl-requests-table td {
     font-size: 12px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+/* Ширины столбцов: ключевые идут первыми и получают больше места */
+.pl-requests-table col.pl-col-check     { width: 4%; }
+.pl-requests-table col.pl-col-num       { width: 4%; }
+.pl-requests-table col.pl-col-amount    { width: 8%; }
+.pl-requests-table col.pl-col-recipient { width: 12%; }
+.pl-requests-table col.pl-col-article   { width: 10%; }
+.pl-requests-table col.pl-col-purpose   { width: 12%; }
+.pl-requests-table col.pl-col-cat       { width: 13%; }
+.pl-requests-table col.pl-col-detail    { width: 13%; }
+.pl-requests-table col.pl-col-request   { width: 4%; }
+.pl-requests-table col.pl-col-reqdate   { width: 5%; }
+.pl-requests-table col.pl-col-status    { width: 4%; }
+.pl-requests-table col.pl-col-paydate   { width: 5%; }
+.pl-requests-table col.pl-col-subdiv    { width: 6%; }
+
+/* Компактные отступы — иначе узкие столбцы не вмещают содержимое */
+#payment-limits-page .pl-requests-table th,
+#payment-limits-page .pl-requests-table td {
+    padding: 6px 6px;
+}
+
+/* Сумма не переносится и выравнивается вправо */
+.pl-requests-table td.number-cell {
+    text-align: right;
     white-space: nowrap;
+}
+
+/* Выпадающие списки «Тип оплаты»/«Детальный лимит» подгоняем под ширину столбца */
+.pl-requests-table .pl-edit-cell,
+.pl-requests-table .pl-edit-cell .pl-row-edit {
+    white-space: nowrap;
+}
+
+.pl-requests-table .pl-edit-cell .pl-row-edit {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
 }
 
 .pl-requests-table .row-needs-review td:first-child {
@@ -3405,11 +3474,6 @@ tr.recon-row-only_excel:hover {
 
 /* Мобильная адаптация */
 @media (max-width: 768px) {
-    .pl-header-info {
-        justify-content: flex-start;
-        margin-top: 8px;
-    }
-
     .pl-actions {
         position: static;
         flex-direction: column;
@@ -3730,6 +3794,90 @@ tr.recon-row-only_excel:hover {
 
 .pl-row-unchecked td {
     color: var(--text-tertiary, #94a3b8);
+}
+
+/* ============================================================
+   ЛИМИТЫ ПЛАТЕЖЕЙ: ПРАВКА «ТИП ОПЛАТЫ» И «ДЕТАЛЬНОГО ЛИМИТА»
+   Прямо в списке заявок: значения — из настроек лимитов.
+   Изменённое значение подсвечивается, как и строка целиком.
+   ============================================================ */
+.pl-edit-cell {
+    white-space: nowrap;
+}
+
+.pl-row-edit {
+    font-size: 12px;
+    font-weight: 400;
+    font-family: inherit;
+    color: var(--text-primary, #0f172a);
+    background: var(--bg-primary, #ffffff);
+    border: 1px solid var(--border-medium, #e2e8f0);
+    border-radius: 6px;
+    padding: 2px 4px;
+    max-width: 200px;
+    cursor: pointer;
+}
+
+.pl-row-edit:hover,
+.pl-row-edit:focus {
+    border-color: var(--primary, #2563eb);
+    outline: none;
+}
+
+/* Значение изменено вручную (отличается от исходного файла) */
+.pl-row-edit-changed {
+    background: #fff7e6;
+    border-color: #f59e0b;
+    font-weight: 500;
+}
+
+/* Значение не сопоставлено с настройками лимитов */
+.pl-row-edit-warn {
+    color: #b45309;
+    border-color: #fbbf24;
+}
+
+.pl-row-edit:disabled {
+    color: var(--text-tertiary, #94a3b8);
+    background: var(--bg-tertiary, #f8fafc);
+    cursor: default;
+}
+
+.pl-row-edited td {
+    background: #fffdf5;
+}
+
+.pl-row-edited td:first-child {
+    box-shadow: inset 3px 0 0 0 #f59e0b;
+}
+
+.pl-edits-chip {
+    background: #fff7e6;
+    border-color: #f59e0b;
+    color: #b45309;
+}
+
+.pl-row-auto td:first-child {
+    box-shadow: inset 3px 0 0 0 #22c55e;
+}
+
+/* Категория ещё не назначена — выбираем из списка */
+.pl-row-edit-empty {
+    border-style: dashed;
+    border-color: #f59e0b;
+    background: #fffbeb;
+}
+
+.pl-auto-chip {
+    background: #f0fdf4;
+    border-color: #86efac;
+    color: #15803d;
+}
+
+.pl-warn-chip {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: #b91c1c;
 }
 
 /* ============================================================

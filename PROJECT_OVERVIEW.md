@@ -131,7 +131,7 @@
 ### 6.2. `StorageManager` (storage.js)
 Хранилище в памяти с кэшем: `files`, `statements`, `transactions`, `accounts`, `innData`, `depositData`, `exclusionRules`, `categorizationRules`, `companyAliases`. Ключевые методы:
 - `loadConfig()` — грузит конфиг через `GET /api/config` (маппинг счетов + правила).
-- `initDeposits()` / `syncDepositsToServer()` — депозиты из БД (`/api/term-deposits`) с fallback на localStorage.
+- `initDeposits()` / `syncDepositsToServer()` — депозиты из БД (`/api/term-deposits`) с fallback на localStorage. При синхронизации отправляются все счета локального состояния, в т.ч. с пустым списком, иначе удаление последнего срочного депозита не сохранилось бы в БД.
 - Вспомогательные: `formatCurrency`, `parseDate`, `calculateInterest`, `getDaysBetween`.
 
 ### 6.3. `BankStatementParser` (parser.js)
@@ -225,7 +225,7 @@
 
 ### 7.8. Срочные депозиты
 | GET | `/api/term-deposits` | Получить депозиты (сгруппированы по счёту) |
-| POST | `/api/term-deposits/sync` | Полная замена депозитов |
+| POST | `/api/term-deposits/sync` | Синхронизация: по каждому счёту из payload строки удаляются и вставляются заново. Счёт с пустым массивом = удалить все его срочные депозиты, поэтому фронтенд шлёт **все** счета локального состояния, включая очищенные. |
 
 ## 8. База данных (schema.sql — 9 таблиц)
 

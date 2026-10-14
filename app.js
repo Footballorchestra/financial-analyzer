@@ -371,6 +371,14 @@ class App {
             this.balancesManager.calculateInterests();
         });
 
+        // Режим «только проценты»: при переключении галочки пересчитываем остатки
+        const depositsInterestOnlyCheckbox = document.getElementById('depositsInterestOnly');
+        if (depositsInterestOnlyCheckbox) {
+            depositsInterestOnlyCheckbox.addEventListener('change', () => {
+                this.balancesManager.updateTable();
+            });
+        }
+
         // Продление срочных (длинных) депозитов до следующего рабочего дня
         const nextWorkingDayBtn = document.getElementById('nextWorkingDayBtn');
         if (nextWorkingDayBtn) {
@@ -1831,11 +1839,25 @@ class App {
             exportBtn.addEventListener('click', () => this.handlePaymentLimitsExport());
         }
 
-        // Обнуление ранее загруженных данных месяца (для повторного прохождения цикла)
+        // Обнуление ранее загруженных данных: период выбирается в отдельном окне
         const resetBtn = document.getElementById('resetPaymentLimitsBtn');
         if (resetBtn) {
-            resetBtn.addEventListener('click', () => this.handlePaymentLimitsReset());
+            resetBtn.addEventListener('click', () => this.openPaymentLimitsResetModal());
         }
+        const resetConfirmBtn = document.getElementById('plResetConfirmBtn');
+        if (resetConfirmBtn) {
+            resetConfirmBtn.addEventListener('click', () => this.handlePaymentLimitsReset());
+        }
+        const resetPeriodSelect = document.getElementById('plResetPeriod');
+        if (resetPeriodSelect) {
+            resetPeriodSelect.addEventListener('change', () => this.renderPaymentLimitsResetInfo());
+        }
+
+        document.querySelectorAll('#paymentLimitsResetModal .close-modal').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.getElementById('paymentLimitsResetModal').classList.remove('active');
+            });
+        });
 
         document.querySelectorAll('#paymentLimitsSettingsModal .close-modal').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -1852,6 +1874,36 @@ class App {
         if (resetBtn) {
             manager.setPreviewFilter(null, null, null);
             this.renderPaymentLimitsUI();
+            return;
+        }
+
+        // Повторная автоподстановка «Типа оплаты» и «Детального лимита» из базы
+        const autoCatBtn = e.target.closest('[data-pl-autocat]');
+        if (autoCatBtn) {
+            e.preventDefault();
+            if (!manager.previewRows.length) {
+                this.showNotification('Загрузите реестр — список заявок пуст', 'info');
+                return;
+            }
+            manager.loadContractorCategories(true).then(() => {
+                const stats = manager.autoAssignCategories(manager.previewRows, true);
+                this.renderPaymentLimitsUI();
+                this.showNotification(stats.fromDb
+                    ? `Из базы подставлено категорий: ${stats.fromDb}`
+                    : 'В базе не нашлось контрагентов для подстановки', stats.fromDb ? 'success' : 'info');
+            });
+            return;
+        }
+
+        // Отмена правок «Тип оплаты»/«Детальный лимит» — возврат к значениям файла
+        const editsResetBtn = e.target.closest('[data-pl-edits-reset]');
+        if (editsResetBtn) {
+            e.preventDefault();
+            const reset = manager.resetRowEdits();
+            this.renderPaymentLimitsUI();
+            this.showNotification(reset
+                ? `Правки отменены: ${reset} заявок возвращены к значениям файла`
+                : 'Правок категорий нет', 'info');
             return;
         }
 
@@ -1884,7 +1936,9 @@ class App {
             return;
         }
 
-        // Клик по подразделению в блоке «Пояснения» — фильтр списка заявок
+        // Клик по подразделению в блоке «Пояснения» — фильтр списка заявок.
+        // Отбор идёт внутри открытой категории (группы), а не по всему подразделению:
+        // если открыта «Филиалы», показываем заявки этого подразделения только из «Филиалов».
         const subdivisionLink = e.target.closest('[data-pl-subdivision]');
         if (subdivisionLink) {
             e.preventDefault();
@@ -1892,14 +1946,15 @@ class App {
                 this.showNotification('Загрузите реестр — список заявок пуст', 'info');
                 return;
             }
-            manager.setPreviewFilter(null, null, null, subdivisionLink.getAttribute('data-pl-subdivision'), null);
+            manager.setPreviewFilter(null, null, manager.explanationGroup, subdivisionLink.getAttribute('data-pl-subdivision'), null);
             this.renderPaymentLimitsUI();
             const blockS = document.getElementById('plPreviewListBlock');
             if (blockS) blockS.scrollIntoView({ behavior: 'smooth', block: 'start' });
             return;
         }
 
-        // Клик по контрагенту в блоке «Пояснения» — фильтр списка заявок
+        // Клик по контрагенту в блоке «Пояснения» — фильтр списка заявок.
+        // Как и у подразделения, отбор идёт внутри открытой категории (группы).
         const recipientLink = e.target.closest('[data-pl-recipient]');
         if (recipientLink) {
             e.preventDefault();
@@ -1907,7 +1962,7 @@ class App {
                 this.showNotification('Загрузите реестр — список заявок пуст', 'info');
                 return;
             }
-            manager.setPreviewFilter(null, null, null, null, recipientLink.getAttribute('data-pl-recipient'));
+            manager.setPreviewFilter(null, null, manager.explanationGroup, null, recipientLink.getAttribute('data-pl-recipient'));
             this.renderPaymentLimitsUI();
             const blockR = document.getElementById('plPreviewListBlock');
             if (blockR) blockR.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1939,8 +1994,30 @@ class App {
     // Поддерживает: отдельную заявку, всю категорию/подстатью/группу и все заявки в списке.
     handlePaymentLimitsRowCheck(e) {
         const input = e.target;
-        if (!input || input.tagName !== 'INPUT') return;
+        if (!input) return;
         const manager = this.paymentLimits;
+
+        // Правка «Тип оплаты» прямо в списке заявок (значения — из настроек лимитов)
+        if (input.tagName === 'SELECT' && input.hasAttribute('data-pl-row-cat')) {
+            const changed = manager.setRowCategory(input.getAttribute('data-pl-row-cat'), input.value);
+            if (changed) {
+                this.renderPaymentLimitsUI();
+                this.showNotification(`«Тип оплаты» изменён: ${input.value || 'не указано'}`, 'success');
+            }
+            return;
+        }
+
+        // Правка «Детальный лимит» прямо в списке заявок
+        if (input.tagName === 'SELECT' && input.hasAttribute('data-pl-row-detail')) {
+            const changed = manager.setRowDetail(input.getAttribute('data-pl-row-detail'), input.value);
+            if (changed) {
+                this.renderPaymentLimitsUI();
+                this.showNotification(`«Детальный лимит» изменён: ${input.value || 'не указано'}`, 'success');
+            }
+            return;
+        }
+
+        if (input.tagName !== 'INPUT') return;
 
         // Правка пояснения прямо в сводной таблице блока «Пояснения»
         if (input.hasAttribute && input.hasAttribute('data-pl-expl')) {
@@ -2072,7 +2149,6 @@ class App {
     // Показ/обновление страницы лимитов (вызывается при переключении на страницу)
     async updatePaymentLimitsUI() {
         const manager = this.paymentLimits;
-        manager.renderHeaderInfo();
 
         // Сначала настройки лимитов (нужны для нормализации категорий/подстатей)
         if (!manager.configLoaded) {
@@ -2113,7 +2189,6 @@ class App {
 
     renderPaymentLimitsUI() {
         const manager = this.paymentLimits;
-        manager.renderHeaderInfo();
         manager.renderControlArea();
 
         // Синхронизируем чекбокс режима «только текущий период»
@@ -2141,10 +2216,6 @@ class App {
         const finalSaveBtn = document.getElementById('saveFinalPaymentLimitsBtn');
         if (finalSaveBtn) finalSaveBtn.disabled = manager.previewRows.length === 0 || manager.selectedCount() === 0;
 
-        // Состояние сохранённого варианта месяца
-        const registryState = document.getElementById('plRegistryState');
-        if (registryState) registryState.textContent = manager.registryStatusText();
-
         if (actions) {
             actions.style.display = manager.previewRows.length > 0 ? 'flex' : 'none';
         }
@@ -2154,20 +2225,17 @@ class App {
         if (actionsInfo) {
             actionsInfo.textContent = manager.previewRows.length
                 ? `Отмечено: ${manager.selectedCount()} из ${manager.previewRows.length} · `
-                  + `${manager.fmtMoney(manager.selectedTotal())} ₽ · ${manager.registryStatusText()}`
+                  + `${manager.fmtMoney(manager.selectedTotal())} ₽ · ${manager.registryStatusShort()}`
                 : '';
         }
         if (hint) {
             if (manager.previewRows.length > 0) {
-                const stage = manager.savedStage();
-                const stageText = stage === 'final' ? 'открыт сохранённый финальный вариант'
-                    : (stage === 'draft' ? 'открыт сохранённый черновик' : 'данные не сохранены');
-                hint.textContent = `Период загрузки: ${manager.periodLabel(manager.currentPeriod)} · ${stageText}. `
-                    + `Отмечено заявок: ${manager.selectedCount()} из ${manager.previewRows.length} `
+                hint.textContent = `${manager.periodLabel(manager.currentPeriod)}: `
+                    + `${manager.selectedCount()} из ${manager.previewRows.length} заявок `
                     + `(${manager.fmtMoney(manager.selectedTotal())} ₽)`;
             } else {
                 hint.textContent = `Загрузите Excel-реестр или дождитесь автозагрузки сохранённого варианта. `
-                    + `Сохранено за месяц: ${manager.confirmedRows.length} платежей.`;
+                    + `Сохранено платежей: ${manager.confirmedRows.length}.`;
             }
             hint.style.color = 'var(--text-secondary)';
         }
@@ -2213,7 +2281,11 @@ class App {
                 await manager.loadRegistryState();
                 await manager.loadConfirmed(manager.currentMonth);
                 this.renderPaymentLimitsUI();
-                this.showNotification(result.message, 'success');
+                let message = result.message;
+                const editsCount = Object.keys(manager.rowEdits()).length;
+                if (editsCount) message += ` · правок категорий: ${editsCount}`;
+                if (result.learned) message += ` · запомнено контрагентов: ${result.learned}`;
+                this.showNotification(message, 'success');
             } else {
                 this.showNotification(result.message || 'Ошибка сохранения', 'error');
             }
@@ -2226,19 +2298,54 @@ class App {
     }
 
     // Обнуление ранее загруженных данных месяца (чтобы пройти полный цикл заново)
+    // Окно «Обнулить загруженное»: по умолчанию выбран текущий период загрузки
+    openPaymentLimitsResetModal() {
+        const manager = this.paymentLimits;
+        const select = document.getElementById('plResetPeriod');
+        if (select) select.value = String(manager.getLoadPeriod());
+        this.renderPaymentLimitsResetInfo();
+        const modal = document.getElementById('paymentLimitsResetModal');
+        if (modal) modal.classList.add('active');
+    }
+
+    // Подсказка в окне обнуления: сколько загрузок удалится
+    renderPaymentLimitsResetInfo() {
+        const manager = this.paymentLimits;
+        const select = document.getElementById('plResetPeriod');
+        const info = document.getElementById('plResetInfo');
+        if (!select || !info) return;
+        const registries = manager.registries || [];
+        const period = select.value ? parseInt(select.value, 10) : null;
+        if (!period) {
+            info.textContent = registries.length
+                ? `Сохранённых загрузок за месяц: ${registries.length}`
+                : 'Сохранённых загрузок за месяц нет';
+            return;
+        }
+        const list = registries.filter(r => Number(r.period) === period);
+        if (!list.length) {
+            info.textContent = `${manager.periodLabel(period)}: сохранённых загрузок нет`;
+            return;
+        }
+        const drafts = list.filter(r => r.draft_saved_at).length;
+        const finals = list.filter(r => r.final_saved_at).length;
+        info.textContent = `${manager.periodLabel(period)}: сохранённых загрузок ${list.length}`
+            + ` · черновиков ${drafts} · финальных ${finals}`;
+    }
+
     async handlePaymentLimitsReset() {
         const manager = this.paymentLimits;
-        const confirmed = window.confirm(
-            'Обнулить ранее загруженные данные за текущий месяц?\n\n'
-            + 'Будут удалены: сохранённый черновик, финальный вариант, платежи и исходный файл реестра. '
-            + 'После этого можно снова загрузить файл и пройти обе стадии согласования.');
-        if (!confirmed) return;
+        const select = document.getElementById('plResetPeriod');
+        const period = select && select.value ? parseInt(select.value, 10) : null;
+        const modal = document.getElementById('paymentLimitsResetModal');
+        if (modal) modal.classList.remove('active');
 
         this.showLoading();
         try {
-            const result = await manager.resetSavedData();
+            const result = await manager.resetSavedData(period);
             if (result.success) {
-                await manager.loadConfirmed();
+                await manager.loadRegistryState();
+                await manager.loadConfirmed(manager.currentMonth);
                 this.renderPaymentLimitsUI();
                 this.showNotification(result.message, 'success');
             } else {

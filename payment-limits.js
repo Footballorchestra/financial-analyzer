@@ -14,6 +14,7 @@ class PaymentLimitsManager {
         this.fileName = null;
         this.sourceFile = null;      // исходный загруженный файл (нужен для экспорта «как в источнике»)
         this.sourceSheetName = null; // имя листа исходного файла
+        this.sourceColumns = null;   // колонки исходного файла (для правок «Тип оплаты»/«Детальный лимит»)
         this.registry = null;        // сохранённый в БД реестр месяца (черновик/финал + файл)
         this.registries = [];        // все сохранённые реестры месяца
         this.localDirty = false;     // были ли изменения отметок после загрузки/сохранения
@@ -27,6 +28,8 @@ class PaymentLimitsManager {
         this.explanationGroup = this.loadExplanationGroupSetting(); // категория в блоке «Пояснения»
         this.library = new Map();    // справочник контрагентов: наименование → пояснение
         this.libraryLoaded = false;
+        this.contractorCategories = new Map();  // справочник из базы: контрагент → «Тип оплаты» и «Детальный лимит»
+        this.contractorCategoriesLoaded = false;
         this.previewFilter = { category: null, detail: null, group: null, subdivision: null, recipient: null }; // фильтр списка заявок
     }
 
@@ -56,8 +59,8 @@ class PaymentLimitsManager {
         ]
     };
 
-    // Категории блока «Разбивка на категории» — значения колонки «Группа» (правый столбец файла).
-    // Порядок задаётся здесь и не зависит от порядка строк в файле.
+    // Категории блоков «Пояснения» и «Разбивка на категории» — значения колонки «Группа» файла.
+    // Из этого же списка строятся вкладки при выгрузке. Порядок задаётся здесь и не зависит от строк файла.
     static GROUP_CATEGORIES = [
         'Филиалы',
         'УК',
@@ -65,8 +68,12 @@ class PaymentLimitsManager {
         'Оплаты в рамках 100 т.р.',
         'Непереносимые оплаты',
         'Графики',
-        'Согласовано в оплату'
+        'Согласовано в оплату',
+        'Кузьмина'
     ];
+
+    // Вкладка для платежей, у которых в колонке «Группа» нет знакомого названия
+    static GROUP_OTHER_NAME = 'Прочее (не сопоставлено)';
 
     // Название периода для интерфейса: «Период 1»..«Период 4»
     periodLabel(p) {
@@ -125,27 +132,39 @@ class PaymentLimitsManager {
 
             const headers = rows[0].map(h => String(h == null ? '' : h).trim());
             const columns = this.detectColumns(headers);
-            if (columns.category === undefined || columns.amount === undefined) {
-                return { success: false, message: 'Не найдены обязательные колонки: "Тип оплаты" и "Сумма"' };
+            // «Тип оплаты» и «Детальный лимит» в файле больше не обязательны:
+            // категории подставляются автоматически по справочнику из базы
+            if (columns.amount === undefined) {
+                return { success: false, message: 'В файле не найдена обязательная колонка "Сумма"' };
             }
             // Колонка «Группа» — самый правый столбец файла: если заголовок не найден, берём последний
             if (columns.group === undefined && headers.length > 0) {
                 columns.group = headers.length - 1;
             }
+            // Колонки файла — нужны для правок «Тип оплаты»/«Детальный лимит» при выгрузке
+            this.sourceColumns = columns;
 
             const preview = [];
             rows.slice(1).forEach((row, rowIndex) => {
                 if (!row.some(cell => cell !== null && cell !== '')) return;
                 const amount = this.parseAmount(row[columns.amount]);
                 if (amount === 0) return;
+                const fileCategory = columns.category !== undefined ? this.cleanString(row[columns.category]) : '';
+                const fileDetail = columns.detailLimit !== undefined ? this.cleanString(row[columns.detailLimit]) : '';
                 preview.push({
                     excelRow: range.s.r + rowIndex + 2, // номер строки в исходном файле (1-based)
                     selected: true,                     // сразу после загрузки все заявки отмечены
-                    category: this.cleanString(row[columns.category]),
+                    category: fileCategory,             // значение из файла (если колонки нет — пусто)
+                    categoryFile: fileCategory,         // как в файле (для выбора «как в файле»)
+                    categoryAuto: fileCategory,         // после автоподстановки из базы (база для правок)
+                    categorySource: fileCategory ? 'file' : '',
+                    categoryUses: 0,
                     amount,
                     articleDds: columns.article !== undefined ? this.cleanString(row[columns.article]) : '',
                     recipient: this.cleanString(row[columns.recipient]),
-                    detailLimit: columns.detailLimit !== undefined ? this.cleanString(row[columns.detailLimit]) : '',
+                    detailLimit: fileDetail,
+                    detailFile: fileDetail,
+                    detailAuto: fileDetail,
                     requestNo: columns.request !== undefined ? this.cleanString(row[columns.request]) : '',
                     requestDate: columns.requestDate !== undefined ? this.formatExcelDate(row[columns.requestDate]) : null,
                     status: columns.status !== undefined ? this.cleanString(row[columns.status]) : '',
@@ -160,9 +179,10 @@ class PaymentLimitsManager {
                 });
             });
 
-            if (!preview.some(r => r.category)) {
-                return { success: false, message: 'В файле не заполнена колонка "Тип оплаты"' };
-            }
+            // «Тип оплаты» и «Детальный лимит» подставляем автоматически по справочнику из базы
+            // (если контрагента там нет — остаётся значение из файла, иначе строка ждёт назначения)
+            await this.loadContractorCategories();
+            const auto = this.autoAssignCategories(preview);
 
             const now = new Date();
             this.sourceFile = file;               // исходный файл — для экспорта без пересборки
@@ -174,7 +194,14 @@ class PaymentLimitsManager {
             this.currentPeriod = this.getLoadPeriod();
             this.currentMonth = this.monthPrefix(now);
             this.fileName = file.name;
-            return { success: true, count: preview.length, message: `Прочитано строк: ${preview.length}` };
+            return {
+                success: true,
+                count: preview.length,
+                auto,
+                message: `Прочитано строк: ${preview.length}`
+                    + (auto.fromDb ? ` · из базы подставлено: ${auto.fromDb}` : '')
+                    + (auto.none ? ` · требуют назначения: ${auto.none}` : '')
+            };
         } catch (error) {
             console.error('Ошибка загрузки файла лимитов:', error);
             return { success: false, message: 'Ошибка загрузки: ' + error.message };
@@ -504,9 +531,10 @@ class PaymentLimitsManager {
         };
     }
 
-    // ===== ЭКСПОРТ В EXCEL: исходный файл без снятых заявок =====
-    // Файл не пересобирается: сервер копирует исходный .xlsx и удаляет из него строки
-    // снятых заявок, поэтому формат, столбцы, оформление и «Дата заявки» остаются исходными.
+    // ===== ЭКСПОРТ В EXCEL: вкладки по категориям (колонка «Группа») =====
+    // Файл не пересобирается: сервер копирует исходный .xlsx, размножает лист по категориям
+    // колонки «Группа» и дописывает на каждую вкладку сводную таблицу блока «Пояснения».
+    // Поэтому формат, столбцы, оформление и «Дата заявки» остаются исходными.
     async exportToExcel() {
         const hasRegistryFile = !!(this.registry && this.registry.has_file);
         if (!this.previewRows.length && !hasRegistryFile) {
@@ -524,6 +552,12 @@ class PaymentLimitsManager {
         // иначе — то, что отмечено на экране.
         const useCurrentSelection = !!this.previewRows.length && (this.localDirty || !exportStage);
 
+        // Сводные таблицы считаем по тому же набору заявок, который попадёт в файл.
+        // Пояснения подтягиваем из «Библиотеки контрагентов» (если ещё не загружены).
+        await this.loadContractorsLibrary();
+        const exportRows = this.exportTargetRows(exportStage, useCurrentSelection);
+        const groupSheets = this.groupSheetsPayload(exportRows);
+
         const payload = {
             sheetName: this.sourceSheetName || '',
             fileName: this.fileName || ''
@@ -531,6 +565,17 @@ class PaymentLimitsManager {
         if (this.registry) payload.registryId = this.registry.id;
         if (exportStage) payload.stage = exportStage;
         if (useCurrentSelection) payload.removeRows = removedBySelection;
+        // Правки «Тип оплаты»/«Детальный лимит»: пишем их и в выгружаемый файл
+        const rowEdits = this.rowEdits();
+        if (Object.keys(rowEdits).length) {
+            payload.rowEdits = rowEdits;
+            payload.editColumns = this.editColumns();
+        }
+        // Вкладки-категории + готовые сводные таблицы (как в блоке «Пояснения»)
+        if (groupSheets.length) {
+            payload.splitByGroup = true;
+            payload.groupSheets = groupSheets;
+        }
 
         try {
             const formData = new FormData();
@@ -562,7 +607,8 @@ class PaymentLimitsManager {
             document.body.removeChild(a);
             window.URL.revokeObjectURL(url);
 
-            const removed = Number(response.headers.get('X-Export-Removed') || removeRows.length) || 0;
+            const removed = Number(response.headers.get('X-Export-Removed') || removedBySelection.length) || 0;
+            const tabs = Number(response.headers.get('X-Export-Tabs') || 0) || 0;
             let warning = response.headers.get('X-Export-Warning') || '';
             if (warning) {
                 try { warning = decodeURIComponent(warning); } catch (e) { /* ignore */ }
@@ -575,11 +621,15 @@ class PaymentLimitsManager {
             } else if (this.registry) {
                 await this.loadRegistryState();
             }
+            const rowsCount = exportRows.length || this.selectedCount();
             return {
                 success: true,
                 removed,
                 warning,
-                message: `Файл «${fileName}»: ${this.selectedCount()} заявок, снято ${removed}` + (warning ? `. ${warning}` : '')
+                tabs,
+                message: `Файл «${fileName}»: ${rowsCount} заявок`
+                    + (tabs ? `, вкладок ${tabs}` : '')
+                    + `, снято ${removed}` + (warning ? `. ${warning}` : '')
             };
         } catch (error) {
             console.error('Ошибка экспорта реестра лимитов:', error);
@@ -633,6 +683,269 @@ class PaymentLimitsManager {
         return this.selectedCount();
     }
 
+    // ===== ПРАВКИ «ТИП ОПЛАТЫ» И «ДЕТАЛЬНЫЙ ЛИМИТ» ПРЯМО В СПИСКЕ ЗАЯВОК =====
+    // Значения берутся из настроек лимитов (категории и их подстатьи), чтобы суммы
+    // попадали в нужный лимит. Исходные значения файла сохраняются — правку можно откатить.
+
+    // Буква колонки Excel по её номеру: 0 → A, 13 → N
+    columnLetter(index) {
+        let num = Number(index) + 1;
+        if (!isFinite(num) || num < 1) return '';
+        let letters = '';
+        while (num > 0) {
+            const rem = (num - 1) % 26;
+            letters = String.fromCharCode(65 + rem) + letters;
+            num = Math.floor((num - 1) / 26);
+        }
+        return letters;
+    }
+
+    // Названия категорий из настроек лимитов
+    categoryNames() {
+        return this.getCategories().map(c => c.name).filter(Boolean);
+    }
+
+    // Подстатьи («Детальный лимит») выбранной категории из настроек лимитов
+    detailNames(categoryName) {
+        const canonical = this.normalizeCategory(categoryName || '');
+        return this.getDetails(canonical).map(d => d.name).filter(Boolean);
+    }
+
+    rowCategoryValue(row) {
+        return String(row.category == null ? '' : row.category).trim();
+    }
+
+    rowDetailValue(row) {
+        return String(row.detailLimit == null ? '' : row.detailLimit).trim();
+    }
+
+    // Автоматически подставленные значения (из базы, иначе из файла) — база для сравнения правок
+    rowCategoryAutoValue(row) {
+        const auto = row.categoryAuto == null ? row.categoryFile : row.categoryAuto;
+        return String(auto == null ? '' : auto).trim();
+    }
+
+    rowDetailAutoValue(row) {
+        const auto = row.detailAuto == null ? row.detailFile : row.detailAuto;
+        return String(auto == null ? '' : auto).trim();
+    }
+
+    // Справочник из базы: контрагент → «Тип оплаты» и «Детальный лимит» (по прошлым загрузкам)
+    async loadContractorCategories(force) {
+        if (this.contractorCategoriesLoaded && !force) {
+            return { success: true, count: this.contractorCategories.size };
+        }
+        try {
+            const response = await fetch('/api/payment-limits/contractor-categories');
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                return { success: false, message: result.error || 'Справочник категорий недоступен' };
+            }
+            this.contractorCategories = new Map();
+            Object.keys(result.categories || {}).forEach(key => {
+                this.contractorCategories.set(this.normalizeContractorName(key), result.categories[key]);
+            });
+            this.contractorCategoriesLoaded = true;
+            return { success: true, count: this.contractorCategories.size };
+        } catch (error) {
+            console.warn('Не удалось загрузить справочник категорий контрагентов:', error);
+            return { success: false, message: error.message };
+        }
+    }
+
+    // Категория и подстатья контрагента из справочника (если он отнесён к категории ранее)
+    categoryFromHistory(recipient) {
+        const key = this.normalizeContractorName(recipient);
+        if (!key || !this.contractorCategories.size) return null;
+        const entry = this.contractorCategories.get(key);
+        if (!entry || !entry.category) return null;
+        const category = this.normalizeCategory(entry.category);
+        // Считаем подстановку полезной, только если категория есть в настройках лимитов
+        if (!this.getCategory(category)) return null;
+        return { category, detail: String(entry.detail || '').trim(), uses: Number(entry.uses) || 0 };
+    }
+
+    // Подставляет категории и подстатьи по справочнику из базы; возвращает статистику
+    autoAssignCategories(rows, onlyEmpty = false) {
+        const stats = { fromDb: 0, fromFile: 0, none: 0 };
+        (rows || this.previewRows).forEach(row => {
+            if (onlyEmpty && this.rowCategoryValue(row)) return;
+            const fileCat = String(row.categoryFile == null ? '' : row.categoryFile).trim();
+            const fileDet = String(row.detailFile == null ? '' : row.detailFile).trim();
+            const found = this.categoryFromHistory(row.recipient);
+            if (found) {
+                row.category = found.category;
+                row.detailLimit = found.detail;
+                row.categoryAuto = found.category;
+                row.detailAuto = found.detail;
+                row.categorySource = 'db';
+                row.categoryUses = found.uses;
+                stats.fromDb += 1;
+                return;
+            }
+            row.category = fileCat;
+            row.detailLimit = fileDet;
+            row.categoryAuto = fileCat;
+            row.detailAuto = fileDet;
+            row.categorySource = fileCat ? 'file' : '';
+            row.categoryUses = 0;
+            if (fileCat) stats.fromFile += 1; else stats.none += 1;
+        });
+        return stats;
+    }
+
+    // Откуда взялось текущее значение: из базы, из файла, назначено вручную или пусто
+    rowCategorySource(row) {
+        if (!this.rowCategoryValue(row)) return '';
+        if (this.rowHasEdit(row)) return 'manual';
+        return row.categorySource === 'db' ? 'db' : (row.categorySource === 'file' ? 'file' : '');
+    }
+
+    // Сколько заявок заполнено из базы / из файла / назначено вручную и сколько ждут назначения
+    autoCategoryStats() {
+        const stats = { fromDb: 0, fromFile: 0, manual: 0, none: 0 };
+        this.previewRows.forEach(row => {
+            const source = this.rowCategorySource(row);
+            if (source === 'db') stats.fromDb += 1;
+            else if (source === 'file') stats.fromFile += 1;
+            else if (source === 'manual') stats.manual += 1;
+            else stats.none += 1;
+        });
+        return stats;
+    }
+
+    // Меняли ли «Тип оплаты»/«Детальный лимит» относительно автоподстановки (из базы или файла)
+    rowHasEdit(row) {
+        return this.rowCategoryValue(row) !== this.rowCategoryAutoValue(row)
+            || this.rowDetailValue(row) !== this.rowDetailAutoValue(row);
+    }
+
+    hasRowEdits() {
+        return this.previewRows.some(row => this.rowHasEdit(row));
+    }
+
+    // Правки для сохранения/выгрузки: {«номер строки файла»: {category, detail}}
+    rowEdits() {
+        const edits = {};
+        this.previewRows.forEach(row => {
+            if (!this.rowHasEdit(row)) return;
+            edits[String(row.excelRow)] = {
+                category: this.rowCategoryValue(row),
+                detail: this.rowDetailValue(row)
+            };
+        });
+        return edits;
+    }
+
+    // Буквы колонок файла для «Тип оплаты» и «Детальный лимит» (для правок в выгружаемом файле)
+    editColumns() {
+        const cols = this.sourceColumns || {};
+        return {
+            category: this.columnLetter(cols.category),
+            detail: this.columnLetter(cols.detailLimit)
+        };
+    }
+
+    // Разносит «Тип оплаты» и «Детальный лимит» по остальным заявкам того же контрагента.
+    // Заполняем только пустые значения — уже заполненные строки не трогаем.
+    // Контрагентов, найденных в базе, пропускаем: там значения подставлены автоматически.
+    propagateContractorValues(sourceRow, dirty = true) {
+        const key = this.normalizeContractorName(sourceRow.recipient);
+        if (!key) return 0;
+        const category = this.rowCategoryValue(sourceRow);
+        const detail = this.rowDetailValue(sourceRow);
+        if (!category && !detail) return 0;
+
+        let applied = 0;
+        this.previewRows.forEach(row => {
+            if (row === sourceRow) return;
+            if (this.normalizeContractorName(row.recipient) !== key) return;
+            // Контрагент найден в базе — его заявки уже заполнены, не трогаем
+            if (row.categorySource === 'db') return;
+
+            let touched = false;
+            // Заполняем только пустые значения: заполненное не перезаписываем
+            if (category && !this.rowCategoryValue(row)) {
+                row.category = category;
+                touched = true;
+            }
+            if (detail && !this.rowDetailValue(row)) {
+                row.detailLimit = detail;
+                touched = true;
+            }
+            if (touched) applied += 1;
+        });
+
+        if (applied && dirty) this.localDirty = true;
+        return applied;
+    }
+
+    setRowCategory(excelRow, value, dirty = true) {
+        const row = this.previewRows.find(r => String(r.excelRow) === String(excelRow));
+        if (!row) return false;
+        const next = String(value == null ? '' : value).trim();
+        const changed = this.rowCategoryValue(row) !== next;
+        if (changed) {
+            row.category = next;
+            // Выбранную вручную подстатью сбрасываем, если в новой категории её нет.
+            // Автоматическое значение (из базы/файла) не трогаем — иначе потеряем данные.
+            const details = this.detailNames(next || row.articleDds || '');
+            const currentDetail = this.rowDetailValue(row);
+            const autoDetail = this.rowDetailAutoValue(row);
+            if (currentDetail && currentDetail !== autoDetail && !details.some(d => d === currentDetail)) {
+                row.detailLimit = '';
+            }
+            if (dirty) this.localDirty = true;
+        }
+        // Такой же «Тип оплаты» и «Детальный лимит» — остальным пустым заявкам контрагента
+        const spread = this.propagateContractorValues(row, dirty);
+        return changed || spread > 0;
+    }
+
+    setRowDetail(excelRow, value, dirty = true) {
+        const row = this.previewRows.find(r => String(r.excelRow) === String(excelRow));
+        if (!row) return false;
+        const next = String(value == null ? '' : value).trim();
+        const changed = this.rowDetailValue(row) !== next;
+        if (changed) {
+            row.detailLimit = next;
+            if (dirty) this.localDirty = true;
+        }
+        // Такой же «Детальный лимит» — остальным пустым заявкам контрагента
+        const spread = this.propagateContractorValues(row, dirty);
+        return changed || spread > 0;
+    }
+
+    // Применяет сохранённые правки к загруженному превью (при восстановлении реестра)
+    applyRowEdits(edits) {
+        if (!edits || typeof edits !== 'object') return 0;
+        let applied = 0;
+        this.previewRows.forEach(row => {
+            const edit = edits[String(row.excelRow)];
+            if (!edit || typeof edit !== 'object') return;
+            if (typeof edit.category === 'string') row.category = edit.category;
+            if (typeof edit.detail === 'string') row.detailLimit = edit.detail;
+            applied += 1;
+        });
+        return applied;
+    }
+
+    // Возврат «Тип оплаты» и «Детальный лимит» к значениям автоподстановки (из базы или файла)
+    resetRowEdits() {
+        let reset = 0;
+        this.previewRows.forEach(row => {
+            const autoCat = this.rowCategoryAutoValue(row);
+            const autoDet = this.rowDetailAutoValue(row);
+            if (this.rowCategoryValue(row) !== autoCat || this.rowDetailValue(row) !== autoDet) {
+                row.category = autoCat;
+                row.detailLimit = autoDet;
+                reset += 1;
+            }
+        });
+        if (reset) this.localDirty = true;
+        return reset;
+    }
+
     async saveStage(stage) {
         if (!this.previewRows.length) {
             return { success: false, message: 'Нет данных для сохранения' };
@@ -672,6 +985,8 @@ class PaymentLimitsManager {
                     payment_type: row.paymentType || ''
                 })),
                 removedRows,
+                // Правки «Тип оплаты»/«Детальный лимит» по строкам файла — сохраняем вместе с вариантом
+                rowEdits: this.rowEdits(),
                 sheetName: this.sourceSheetName || '',
                 fileName: this.fileName || '',
                 rowCount: this.previewRows.length,
@@ -690,12 +1005,15 @@ class PaymentLimitsManager {
             this.registry.period = result.period;
             this.registry.limit_month = result.month;
             this.registry.row_count = this.previewRows.length;
+            const savedRowEdits = this.rowEdits();
             if (stage === 'final') {
                 this.registry.final_saved_at = result.saved_at;
                 this.registry.final_removed_rows = removedRows;
+                this.registry.final_row_edits = savedRowEdits;
             } else {
                 this.registry.draft_saved_at = result.saved_at;
                 this.registry.draft_removed_rows = removedRows;
+                this.registry.draft_row_edits = savedRowEdits;
             }
             this.localDirty = false;
             // Локальный файл больше не нужен — он сохранён в БД
@@ -708,6 +1026,7 @@ class PaymentLimitsManager {
                 stage: result.stage,
                 count: result.count,
                 removed: result.removed_count,
+                learned: result.contractors_learned,
                 total: result.total_amount,
                 saved_at: result.saved_at,
                 message: result.message
@@ -773,6 +1092,11 @@ class PaymentLimitsManager {
                 ? this.registry.final_removed_rows
                 : this.registry.draft_removed_rows;
             this.applyRemovedRows(removedRows);
+            // Восстанавливаем сохранённые правки «Тип оплаты»/«Детальный лимит»
+            const savedEdits = stage === 'final'
+                ? this.registry.final_row_edits
+                : this.registry.draft_row_edits;
+            const editsApplied = this.applyRowEdits(savedEdits);
             // Превью — копия сохранённого варианта: в итогах не складываем её с БД
             this.previewIsSavedCopy = true;
 
@@ -780,10 +1104,12 @@ class PaymentLimitsManager {
                 success: true,
                 stage,
                 removed: (removedRows || []).length,
+                row_edits: editsApplied,
                 count: loaded.count,
                 total: this.selectedTotal(),
                 message: `Загружен ${stage === 'final' ? 'финальный вариант' : 'черновик'}: `
                     + `${loaded.count} заявок, снято ${(removedRows || []).length}`
+                    + (editsApplied ? `, правок категорий ${editsApplied}` : '')
             };
         } catch (error) {
             console.error('Ошибка автозагрузки сохранённого реестра:', error);
@@ -803,32 +1129,17 @@ class PaymentLimitsManager {
         }
     }
 
-    // Текст состояния сохранённого варианта для шапки страницы
-    registryStatusText() {
-        if (!this.registry) return 'нет сохранённых данных';
-        const fmt = (iso) => {
-            if (!iso) return '';
-            const d = new Date(iso);
-            if (isNaN(d.getTime())) return String(iso);
-            return d.toLocaleString('ru-RU', {
-                day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
-            });
-        };
-        const parts = [];
-        if (this.registry.draft_saved_at) parts.push(`черновик сохранён ${fmt(this.registry.draft_saved_at)}`);
-        if (this.registry.final_saved_at) parts.push(`финал сохранён ${fmt(this.registry.final_saved_at)}`);
-        if (!parts.length) return 'нет сохранённых данных';
-        const dirty = this.localDirty ? ' · есть несохранённые правки' : '';
-        const count = this.periodRegistriesCount();
-        const regs = count > 1 ? ` · загрузок в периоде: ${count}` : '';
-        return `${parts.join(' · ')} · ${this.periodLabel(this.registry.period)}${regs}${dirty}`;
-    }
-
-    // Обнуление ранее загруженных данных месяца (черновик, финал, платежи и исходный файл)
-    async resetSavedData() {
+    // Обнуление ранее загруженных данных: период (1..4) или весь месяц (period = null)
+    async resetSavedData(period = null) {
+        let targetPeriod = null;
         try {
-            // Обнуляем весь месяц целиком (все периоды и обе стадии)
+            const parsed = parseInt(period, 10);
+            if (parsed >= 1 && parsed <= 4) targetPeriod = parsed;
+        } catch (e) { /* остаётся весь месяц */ }
+
+        try {
             const payload = { month: this.currentMonth || this.monthPrefix(new Date()) };
+            if (targetPeriod) payload.period = targetPeriod;
 
             const response = await fetch('/api/payment-limits/reset', {
                 method: 'POST',
@@ -840,24 +1151,47 @@ class PaymentLimitsManager {
                 return { success: false, message: result.error || result.message || 'Ошибка обнуления' };
             }
 
-            // Полностью очищаем состояние страницы, чтобы начать с чистого листа
-            this.previewRows = [];
             this.previewFilter = { category: null, detail: null, group: null, subdivision: null, recipient: null };
-            this.registry = null;
-            this.registries = [];
-            this.confirmedRows = [];
-            this.confirmedLoaded = false;
-            this.previewIsSavedCopy = false;
-            this.localDirty = false;
-            this.fileName = null;
-            this.sourceFile = null;
-            this.sourceSheetName = null;
+
+            if (!targetPeriod) {
+                // Обнулили весь месяц — чистим состояние полностью
+                this.previewRows = [];
+                this.registry = null;
+                this.registries = [];
+                this.confirmedRows = [];
+                this.confirmedLoaded = false;
+                this.previewIsSavedCopy = false;
+                this.localDirty = false;
+                this.fileName = null;
+                this.sourceFile = null;
+                this.sourceSheetName = null;
+            } else {
+                // Обнулили один период: убираем его сохранённые загрузки,
+                // а превью очищаем, если оно относилось к этому же периоду
+                this.registries = (this.registries || [])
+                    .filter(r => Number(r.period) !== targetPeriod);
+                if (this.registry && Number(this.registry.period) === targetPeriod) {
+                    this.registry = null;
+                }
+                if (Number(this.currentPeriod) === targetPeriod) {
+                    this.previewRows = [];
+                    this.previewIsSavedCopy = false;
+                    this.localDirty = false;
+                    this.fileName = null;
+                    this.sourceFile = null;
+                    this.sourceSheetName = null;
+                }
+            }
 
             return {
                 success: true,
+                period: targetPeriod,
                 payments: result.payments_deleted,
                 registries: result.registries_deleted,
-                message: result.message
+                message: (targetPeriod
+                    ? `Обнулён ${this.periodLabel(targetPeriod)}: удалено платежей ${result.payments_deleted}`
+                    : `Обнулён весь месяц: удалено платежей ${result.payments_deleted}`)
+                    + `, реестров ${result.registries_deleted}. Можно загрузить файл заново`
             };
         } catch (error) {
             console.error('Ошибка обнуления данных лимитов:', error);
@@ -1105,18 +1439,16 @@ class PaymentLimitsManager {
         });
     }
 
-    renderHeaderInfo() {
-        const now = new Date();
-        const elDate = document.getElementById('plHeaderDate');
-        const elPeriod = document.getElementById('plHeaderPeriod');
-        const elMonth = document.getElementById('plHeaderMonth');
-        if (elDate) elDate.textContent = now.toLocaleDateString('ru-RU');
-        if (elPeriod) {
-            const p = this.getLoadPeriod();
-            const mode = this.selectedPeriod ? 'выбрано вручную' : 'авто по дате';
-            elPeriod.textContent = `${this.periodLabel(p)} (${PaymentLimitsManager.PERIOD_DAYS[p]} числа) · ${mode}`;
-        }
-        if (elMonth) elMonth.textContent = this.monthHuman(now);
+    // Короткий статус сохранённого варианта для нижней панели (полный текст не нужен)
+    registryStatusShort() {
+        if (!this.registry) return 'нет сохранённых данных';
+        const hasDraft = !!this.registry.draft_saved_at;
+        const hasFinal = !!this.registry.final_saved_at;
+        if (!hasDraft && !hasFinal) return 'нет сохранённых данных';
+        let text = hasFinal ? (hasDraft ? 'черновик и финал сохранены' : 'финал сохранён')
+            : 'черновик сохранён';
+        if (this.localDirty) text += ' · есть несохранённые правки';
+        return text;
     }
 
     periodThHtml(p) {
@@ -1137,9 +1469,11 @@ class PaymentLimitsManager {
     }
 
     // Сколько загрузок (партий) сохранено в текущем периоде
-    periodRegistriesCount() {
+    // (нужно только для окна обнуления и подписей)
+    periodRegistriesCount(period) {
+        const target = period ? Number(period) : Number(this.getLoadPeriod());
         return (this.registries || [])
-            .filter(r => Number(r.period) === Number(this.getLoadPeriod()))
+            .filter(r => Number(r.period) === target)
             .length;
     }
 
@@ -1162,9 +1496,7 @@ class PaymentLimitsManager {
     modeNote() {
         if (!this.isSavedCopyMode()) return '';
         const stage = this.savedStage() === 'final' ? 'финальный вариант' : 'черновик';
-        const count = this.periodRegistriesCount();
-        return ` · открыта сохранённая загрузка (${stage})`
-            + (count > 1 ? `; в периоде сохранено загрузок: ${count}` : '');
+        return ` · открыта сохранённая загрузка (${stage})`;
     }
 
     // Подпись под суммой в ячейке
@@ -1562,11 +1894,8 @@ class PaymentLimitsManager {
         return Math.min(Math.max(length + 2, 14), 45);
     }
 
-    // Сводная «Контрагент × Подразделение» + «Итого» + «Пояснение»
-    explanationPivot() {
-        const rows = this.selectedPreviewRows()
-            .filter(row => this.normalizeGroup(row.group) === this.explanationGroup);
-
+    // Сводная «Контрагент × Подразделение» + «Итого» + «Пояснение» по заданным заявкам
+    pivotFromRows(rows) {
         const byContractor = new Map();
         const subdivisions = new Set();
         rows.forEach(row => {
@@ -1599,7 +1928,59 @@ class PaymentLimitsManager {
             grand += value;
         });
 
-        return { columns, items, totals, grand, rowsCount: rows.length };
+        return { columns, items, totals, grand };
+    }
+
+    // Сводная блока «Пояснения» для выбранной категории (как показывается на экране)
+    explanationPivot() {
+        const rows = this.selectedPreviewRows()
+            .filter(row => this.normalizeGroup(row.group) === this.explanationGroup);
+        const pivot = this.pivotFromRows(rows);
+        pivot.rowsCount = rows.length;
+        return pivot;
+    }
+
+    // Сводные таблицы для выгрузки по вкладкам: тот же набор и порядок, что в блоке «Пояснения»
+    exportGroupPivots(rows) {
+        const list = (rows || []).filter(row => Number(row.amount));
+        const sheets = PaymentLimitsManager.GROUP_CATEGORIES.map(name => ({
+            name,
+            pivot: this.pivotFromRows(list.filter(row => this.normalizeGroup(row.group) === name))
+        }));
+        const otherRows = list.filter(row => !this.normalizeGroup(row.group));
+        if (otherRows.length) {
+            sheets.push({
+                name: PaymentLimitsManager.GROUP_OTHER_NAME,
+                pivot: this.pivotFromRows(otherRows)
+            });
+        }
+        return sheets;
+    }
+
+    // Полезная нагрузка для сервера: сводные таблицы по вкладкам (суммы — с копейками)
+    groupSheetsPayload(rows) {
+        const round2 = (value) => Math.round((Number(value) || 0) * 100) / 100;
+        return this.exportGroupPivots(rows).map(sheet => ({
+            name: sheet.name,
+            headers: sheet.pivot.columns,
+            rows: sheet.pivot.items.map(item => ({
+                contractor: item.contractor,
+                values: sheet.pivot.columns.map(c => round2(item.bySub[c])),
+                total: round2(item.total),
+                explanation: item.explanation || ''
+            }))
+        }));
+    }
+
+    // Набор заявок, который попадёт в файл: отметки на экране либо сохранённый вариант стадии
+    exportTargetRows(stage, useCurrentSelection) {
+        if (useCurrentSelection) return this.selectedPreviewRows();
+        if (!stage || !this.registry) return [];
+        const saved = stage === 'final'
+            ? this.registry.final_removed_rows
+            : this.registry.draft_removed_rows;
+        const removed = new Set((saved || []).map(v => String(v)));
+        return this.previewRows.filter(row => !removed.has(String(row.excelRow)));
     }
 
     // Блок «Пояснения»: кнопки категорий + сводная таблица с пояснениями из библиотеки.
@@ -1686,6 +2067,74 @@ class PaymentLimitsManager {
             </div>`;
     }
 
+    // Варианты списка вне настроек: «как в файле», «авто» (из базы) и текущее значение
+    selectExtras(row, field) {
+        const fileRaw = field === 'category' ? row.categoryFile : row.detailFile;
+        const autoRaw = field === 'category' ? row.categoryAuto : row.detailAuto;
+        const names = field === 'category'
+            ? this.categoryNames()
+            : this.detailNames(this.rowCategoryValue(row) || row.articleDds || '');
+        const current = field === 'category' ? this.rowCategoryValue(row) : this.rowDetailValue(row);
+        const fileValue = String(fileRaw == null ? '' : fileRaw).trim();
+        const autoValue = String(autoRaw == null ? '' : autoRaw).trim();
+        const extras = [];
+        const add = (value, label) => {
+            if (!value || names.some(n => n === value) || extras.some(e => e.value === value)) return;
+            extras.push({ value, label });
+        };
+        add(fileValue, 'как в файле');
+        if (autoValue !== fileValue) add(autoValue, 'авто');
+        add(current, 'текущее');
+        return { extras, names, current };
+    }
+
+    // Подсказка о происхождении значения: из базы (сколько раз) или из файла
+    rowSourceTitle(row) {
+        const source = this.rowCategorySource(row);
+        if (source === 'db') {
+            const uses = Number(row.categoryUses) || 0;
+            return `Категория из базы${uses ? ` (встречался ${uses} раз)` : ''}`;
+        }
+        if (source === 'file') return 'Категория из файла';
+        if (source === 'manual') return 'Категория назначена вручную';
+        return 'Категория не назначена — выберите из списка';
+    }
+
+    // Выпадающий список «Тип оплаты» прямо в списке заявок (значения — из настроек лимитов)
+    rowCategorySelectHtml(row) {
+        const { extras, names, current } = this.selectExtras(row, 'category');
+        let options = `<option value=""${current ? '' : ' selected'}>— не указано —</option>`;
+        extras.forEach(item => {
+            options += `<option value="${this.escapeHtml(item.value)}"${item.value === current ? ' selected' : ''}>`
+                + `${this.escapeHtml(item.value)} (${item.label})</option>`;
+        });
+        names.forEach(name => {
+            options += `<option value="${this.escapeHtml(name)}"${name === current ? ' selected' : ''}>${this.escapeHtml(name)}</option>`;
+        });
+        const unknown = this.normalizeCategory(current) ? '' : ' pl-row-edit-warn';
+        const empty = current ? '' : ' pl-row-edit-empty';
+        return `<select class="pl-row-edit${unknown}${empty}${this.rowHasEdit(row) ? ' pl-row-edit-changed' : ''}"`
+            + ` data-pl-row-cat="${row.excelRow}"`
+            + ` title="Изменить «Тип оплаты» — категория лимита. ${this.escapeHtml(this.rowSourceTitle(row))}">${options}</select>`;
+    }
+
+    // Выпадающий список «Детальный лимит» (подстатьи выбранной категории)
+    rowDetailSelectHtml(row) {
+        const { extras, names, current } = this.selectExtras(row, 'detail');
+        let options = `<option value=""${current ? '' : ' selected'}>— не указано —</option>`;
+        extras.forEach(item => {
+            options += `<option value="${this.escapeHtml(item.value)}"${item.value === current ? ' selected' : ''}>`
+                + `${this.escapeHtml(item.value)} (${item.label})</option>`;
+        });
+        names.forEach(name => {
+            options += `<option value="${this.escapeHtml(name)}"${name === current ? ' selected' : ''}>${this.escapeHtml(name)}</option>`;
+        });
+        const noChoice = !names.length && !extras.length ? ' disabled' : '';
+        return `<select class="pl-row-edit${this.rowHasEdit(row) ? ' pl-row-edit-changed' : ''}"`
+            + ` data-pl-row-detail="${row.excelRow}"${noChoice}`
+            + ` title="Изменить «Детальный лимит» — подстатья выбранной категории">${options}</select>`;
+    }
+
     previewRowsHtml() {
         if (!this.previewRows.length) return '';
         const rows = this.filteredPreviewRows();
@@ -1695,25 +2144,26 @@ class PaymentLimitsManager {
             .filter(Boolean).join(' / ');
         const selectedCount = this.selectedCount();
         const selectedSum = this.selectedTotal();
+        const autoStats = this.autoCategoryStats();
 
         let rowsHtml = rows.map((row, idx) => {
             const selected = this.isRowSelected(row);
             return `
-            <tr class="${this.rowCategory(row) ? '' : 'row-needs-review'}${selected ? '' : ' pl-row-unchecked'}">
+            <tr class="${this.rowCategory(row) ? '' : 'row-needs-review'}${selected ? '' : ' pl-row-unchecked'}${this.rowHasEdit(row) ? ' pl-row-edited' : ''}${this.rowCategorySource(row) === 'db' ? ' pl-row-auto' : ''}">
                 <td class="pl-check-cell"><input type="checkbox" data-pl-row="${row.excelRow}"${selected ? ' checked' : ''}
                         title="${selected ? 'Заявка учитывается в итогах и экспорте' : 'Заявка снята: не попадает в итоги и экспорт'}"></td>
                 <td>${idx + 1}</td>
                 <td class="number-cell">${this.fmtMoney(row.amount)}</td>
                 <td>${this.escapeHtml(row.recipient)}</td>
                 <td>${this.escapeHtml(row.articleDds)}</td>
-                <td>${this.escapeHtml(row.category)}</td>
-                <td>${this.escapeHtml(row.detailLimit)}</td>
+                <td title="${this.escapeHtml(row.purpose)}">${this.escapeHtml(row.purpose).slice(0, 70)}</td>
+                <td class="pl-edit-cell">${this.rowCategorySelectHtml(row)}</td>
+                <td class="pl-edit-cell">${this.rowDetailSelectHtml(row)}</td>
                 <td>${this.escapeHtml(row.requestNo)}</td>
                 <td>${this.escapeHtml(row.requestDate)}</td>
                 <td>${this.escapeHtml(row.status)}</td>
                 <td>${this.escapeHtml(row.paymentDate)}</td>
                 <td>${this.escapeHtml(row.subdivision)}</td>
-                <td title="${this.escapeHtml(row.purpose)}">${this.escapeHtml(row.purpose).slice(0, 70)}</td>
             </tr>`;
         }).join('');
 
@@ -1724,18 +2174,42 @@ class PaymentLimitsManager {
         return `
             <div class="pl-block pl-block-flat" id="plPreviewListBlock">
                 <div class="pl-block-title"><i class="fas fa-list-alt"></i> Список загруженных заявок (превью)
-                    <small>${this.fileName ? 'файл: ' + this.escapeHtml(this.fileName) : ''} · загрузка в ${this.periodLabel(this.currentPeriod)}</small>
+                    <small>${this.fileName ? 'файл: ' + this.escapeHtml(this.fileName) : ''} · загрузка в ${this.periodLabel(this.currentPeriod)}
+                        · «Тип оплаты» и «Детальный лимит» подставляются из базы по контрагенту${autoStats.manual ? ' (назначено вручную: ' + autoStats.manual + ')' : ''}</small>
                     <span class="pl-filter-chip">Выбрано: ${selectedCount} из ${this.previewRows.length} · ${this.fmtMoney(selectedSum)} ₽</span>
+                    ${autoStats.fromDb ? `<span class="pl-filter-chip pl-auto-chip" title="Категории и подстатьи подставлены автоматически по прошлым загрузкам">Из базы: ${autoStats.fromDb}</span>` : ''}
+                    ${autoStats.none ? `<span class="pl-filter-chip pl-warn-chip" title="Этих контрагентов ещё не относили к категориям — назначьте их в списке ниже">Ждут назначения: ${autoStats.none}</span>` : ''}
                     <span class="pl-select-btns">
                         <button type="button" class="pl-select-btn" data-pl-select="all" title="Отметить все заявки">Выбрать все</button>
                         <button type="button" class="pl-select-btn" data-pl-select="none" title="Снять все заявки — итоги обнулятся">Снять все</button>
+                        <button type="button" class="pl-select-btn" data-pl-autocat="1" title="Ещё раз подставить категории из базы по контрагентам (например, если справочник пополнился)">Подставить из базы</button>
                     </span>
+                    ${this.hasRowEdits() ? `<span class="pl-filter-chip pl-edits-chip">Правок категорий: ${Object.keys(this.rowEdits()).length}
+                        <button type="button" class="pl-filter-reset" data-pl-edits-reset="1" title="Вернуть «Тип оплаты» и «Детальный лимит» к значениям из базы/файла">✕</button></span>` : ''}
                     ${hasFilter ? `<span class="pl-filter-chip">Фильтр: ${this.escapeHtml(filterLabel)} (${rows.length} из ${this.previewRows.length})
                         <button type="button" class="pl-filter-reset" data-pl-filter-reset="1" title="Сбросить фильтр">✕</button></span>` : ''}
                 </div>
                 <div class="data-table-wrapper pl-table-wrap">
+                <!-- Порядок столбцов задан только для интерфейса и отличается от порядка в файле.
+                     Выгрузка Excel использует исходный файл и номера его колонок, поэтому порядок
+                     столбцов в выгружаемом файле не меняется. -->
                 <table class="data-table pl-requests-table">
-                    <thead><tr><th class="pl-check-col" title="Отметка заявок">${this.groupToggleHtml(rows, 'data-pl-select-toggle="1"', `Отметить/снять все заявки в списке (${rows.length})`)}</th><th>№</th><th>Сумма, ₽</th><th>Получатель</th><th>Статья движения ДС</th><th>Тип оплаты</th><th>Детальный лимит</th><th>Заявка</th><th>Дата заявки</th><th>Статус</th><th>Дата оплаты</th><th>Подразделение</th><th>Назначение платежа</th></tr></thead>
+                    <colgroup>
+                        <col class="pl-col-check">
+                        <col class="pl-col-num">
+                        <col class="pl-col-amount">
+                        <col class="pl-col-recipient">
+                        <col class="pl-col-article">
+                        <col class="pl-col-purpose">
+                        <col class="pl-col-cat">
+                        <col class="pl-col-detail">
+                        <col class="pl-col-request">
+                        <col class="pl-col-reqdate">
+                        <col class="pl-col-status">
+                        <col class="pl-col-paydate">
+                        <col class="pl-col-subdiv">
+                    </colgroup>
+                    <thead><tr><th class="pl-check-col" title="Отметка заявок">${this.groupToggleHtml(rows, 'data-pl-select-toggle="1"', `Отметить/снять все заявки в списке (${rows.length})`)}</th><th>№</th><th>Сумма, ₽</th><th>Получатель</th><th>Статья движения ДС</th><th>Назначение платежа</th><th>Тип оплаты</th><th>Детальный лимит</th><th>Заявка</th><th>Дата заявки</th><th>Статус</th><th>Дата оплаты</th><th>Подразделение</th></tr></thead>
                     <tbody>${rowsHtml}</tbody>
                 </table></div>
             </div>`;

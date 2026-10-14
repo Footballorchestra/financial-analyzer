@@ -3,8 +3,10 @@ from flask_cors import CORS
 import openpyxl
 import openpyxl.utils
 from openpyxl.styles import numbers, Alignment, Font, PatternFill, Border, Side
+from openpyxl.styles.cell_style import StyleArray
 from openpyxl.worksheet.views import Pane
-from copy import copy
+from openpyxl.worksheet.cell_range import CellRange
+from openpyxl.worksheet.merge import MergedCellRange
 import io
 import base64
 import re
@@ -17,6 +19,7 @@ import logging
 import gc
 from logging.handlers import RotatingFileHandler
 import urllib.parse
+import uuid
 import db
 import allocator
 from flask_limiter import Limiter
@@ -74,7 +77,7 @@ limiter = Limiter(
 # ============================================================
 CORS(app,
      expose_headers=['X-Filial-Data', 'X-Allocation-Summary', 'X-Email-Data',
-                     'X-Export-Removed', 'X-Export-Warning'],
+                     'X-Export-Removed', 'X-Export-Warning', 'X-Export-Tabs'],
      resources={r'/*': {'origins': '*'}})
 
 # ============================================================
@@ -155,21 +158,106 @@ SUM_COLUMNS = [
 
 NUMERIC_COLUMNS = SUM_COLUMNS + [COLUMNS['DAYS']]
 
-def is_cell_merged(ws, row, col):
+# ============================================================
+# КЭШ ОБЪЕДИНЁННЫХ ЯЧЕЕК
+# is_cell_merged()/get_cell_to_write() вызываются десятки тысяч раз за один
+# запрос /save-excel. Линейный обход ws.merged_cells.ranges на каждый вызов
+# делал пересчёт итогов и сортировку подразделений квадратичными
+# (O(строки × колонки × объединения)) — на реальном реестре это давало
+# десятки секунд. Кэшируем карту «координата → якорь объединения» один раз
+# на лист.
+# ============================================================
+_MERGED_CELLS_CACHE_ATTR = '_fa_merged_cells_map'
+
+
+def _invalidate_merged_cells_cache(ws):
+    """Сбрасывает кэш объединённых ячеек листа (вызывать после merge/unmerge)."""
+    try:
+        delattr(ws, _MERGED_CELLS_CACHE_ATTR)
+    except AttributeError:
+        pass
+
+
+def get_merged_cells_map(ws):
+    """Карта {(row, col): (anchor_row, anchor_col)} для объединённых ячеек.
+
+    Необъединённые ячейки в карте отсутствуют. Строится один раз на лист и
+    переиспользуется всеми операциями чтения/записи.
+    """
+    cached = getattr(ws, _MERGED_CELLS_CACHE_ATTR, None)
+    if cached is not None:
+        return cached
+    merged = {}
     for merged_range in ws.merged_cells.ranges:
-        if (merged_range.min_row <= row <= merged_range.max_row and
-            merged_range.min_col <= col <= merged_range.max_col):
-            return True
-    return False
+        anchor = (merged_range.min_row, merged_range.min_col)
+        for r in range(merged_range.min_row, merged_range.max_row + 1):
+            for c in range(merged_range.min_col, merged_range.max_col + 1):
+                merged[(r, c)] = anchor
+    setattr(ws, _MERGED_CELLS_CACHE_ATTR, merged)
+    return merged
+
+
+def is_cell_merged(ws, row, col):
+    return (row, col) in get_merged_cells_map(ws)
 
 def get_cell_to_write(ws, row, col):
-    if not is_cell_merged(ws, row, col):
+    anchor = get_merged_cells_map(ws).get((row, col))
+    if anchor is None:
         return ws.cell(row=row, column=col)
-    for merged_range in ws.merged_cells.ranges:
-        if (merged_range.min_row <= row <= merged_range.max_row and
-            merged_range.min_col <= col <= merged_range.max_col):
-            return ws.cell(row=merged_range.min_row, column=merged_range.min_col)
-    return ws.cell(row=row, column=col)
+    return ws.cell(row=anchor[0], column=anchor[1])
+
+
+# Компоненты стиля ячейки: (поле StyleArray, коллекция в книге, свойство ячейки)
+_STYLE_COLLECTIONS = (
+    ('fontId', '_fonts', 'font'),
+    ('fillId', '_fills', 'fill'),
+    ('borderId', '_borders', 'border'),
+    ('protectionId', '_protections', 'protection'),
+    ('alignmentId', '_alignments', 'alignment'),
+)
+
+
+def copy_cell_style(src_cell, dst_cell):
+    """Переносит стиль ячейки в ячейку другой книги без XML-копирования.
+
+    openpyxl реализует __copy__ стилей через to_tree/from_tree (~80 мкс на
+    объект, 6 объектов на ячейку). Просто скопировать StyleArray нельзя:
+    он хранит индексы в таблицах стилей книги (у другой книги это другие
+    объекты). Поэтому берём сами объекты стилей из таблиц исходной книги по
+    индексам ячейки — целевая книга зарегистрирует их у себя, а IndexedList
+    дедуплицирует по значению. Объекты стилей неизменяемы, поэтому их
+    совместное использование между книгами безопасно.
+    """
+    style = src_cell._style
+    if style is None:
+        return
+    src_wb = src_cell.parent.parent
+    for key, collection, attr in _STYLE_COLLECTIONS:
+        setattr(dst_cell, attr, getattr(src_wb, collection)[getattr(style, key)])
+    dst_cell.number_format = src_cell.number_format
+
+
+def add_merged_range_fast(ws, coord, existing_ranges=None):
+    """Добавляет объединение без полного обхода списка объединений (O(M)).
+
+    Повторяет ws.merge_cells(), но вместо O(M)-поиска пересечений кладёт
+    диапазон в множество напрямую. Применимо только к заведомо
+    непересекающимся диапазонам (перенос уже существующих объединений,
+    копирование листа).
+
+    existing_ranges — «оставшиеся на месте» объединения, с которыми нужно
+    свериться на вложенность (их обычно мало: шапка, строки за пределами
+    сортировки). Для копирования листа не нужен — диапазоны исходного листа
+    взаимно непересекающиеся.
+    """
+    mcr = MergedCellRange(ws, coord)
+    if existing_ranges and any(mcr.issubset(other) for other in existing_ranges):
+        # как ws.merge_cells(): диапазон уже входит в существующее объединение
+        pass
+    else:
+        ws.merged_cells.ranges.add(mcr)
+    ws._clean_merge_range(mcr)
+    return mcr
 
 def safe_set_number_format(ws, row, col, value):
     if row <= 13:
@@ -188,15 +276,11 @@ def safe_set_value(ws, row, col, value):
 
 def align_numeric_cells(ws):
     logger.info("Выравнивание числовых ячеек по правому краю...")
-    # Кэшируем merged ranges для O(1) проверки вместо O(N) на каждую ячейку
-    merged_set = set()
-    for merged_range in ws.merged_cells.ranges:
-        for r in range(merged_range.min_row, merged_range.max_row + 1):
-            for c in range(merged_range.min_col, merged_range.max_col + 1):
-                merged_set.add((r, c))
+    # Общий кэш объединённых ячеек: O(1) проверка вместо O(merges) на ячейку
+    merged_map = get_merged_cells_map(ws)
     for row in range(14, ws.max_row + 1):
         for col in NUMERIC_COLUMNS:
-            if (row, col) in merged_set:
+            if (row, col) in merged_map:
                 continue
             cell = ws.cell(row=row, column=col)
             if cell.value is not None:
@@ -236,8 +320,12 @@ def sort_filial_blocks_by_overdue(ws):
         data_end = total_row
     else:
         data_end = start
-        for r in range(start, ws.max_row + 1):
-            for c in range(1, min(ws.max_column, 30) + 1):
+        # ws.max_row/ws.max_column — «дорогие» свойства (сканируют все ячейки),
+        # поэтому вычисляем их один раз до циклов.
+        max_row_limit = ws.max_row
+        max_col_limit = min(ws.max_column, 30)
+        for r in range(start, max_row_limit + 1):
+            for c in range(1, max_col_limit + 1):
                 if ws.cell(row=r, column=c).value is not None:
                     data_end = r + 1
 
@@ -289,11 +377,14 @@ def sort_filial_blocks_by_overdue(ws):
     # должно быть записано на строку (sort_start + p).
     row_map = {row: sort_start + p for p, row in enumerate(new_rows)}
 
-    # Снимок содержимого строк и высот ДО очистки
+    # Снимок содержимого строк и высот ДО очистки.
+    # ws.max_column вычисляется один раз: внутри цикла по строкам это свойство
+    # каждый раз сканирует все ячейки листа (O(rows × cols²) на больших файлах).
     cells_snapshot = []
+    max_col = ws.max_column
     for r in old_rows:
         row_cells = []
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, max_col + 1):
             if (r, c) in ws._cells:
                 row_cells.append((c, ws._cells[(r, c)]))
         cells_snapshot.append((r, row_cells))
@@ -317,6 +408,12 @@ def sort_filial_blocks_by_overdue(ws):
                 logger.warning(f"Объединение {rng} пересекает границы блоков — не переносится")
     for rng, _ in merge_map:
         ws.merged_cells.remove(rng)
+    # Объединения, оставшиеся на месте (шапка, строки за пределами сортировки).
+    # Их немного, и по ним проверяется вложенность переносимых диапазонов —
+    # чтобы поведение совпадало с ws.merge_cells().
+    kept_merge_ranges = list(ws.merged_cells.ranges)
+    # Объединения изменились — сбрасываем кэш карты ячеек
+    _invalidate_merged_cells_cache(ws)
 
     # Очищаем диапазон: удаляем старые ячейки и свойства строк
     for key in [k for k in list(ws._cells) if sort_start <= k[0] < sort_end]:
@@ -332,12 +429,12 @@ def sort_filial_blocks_by_overdue(ws):
             dst_cell = ws.cell(row=new_row, column=col)
             dst_cell.value = src_cell.value
             if src_cell.has_style:
-                dst_cell.font = copy(src_cell.font)
-                dst_cell.border = copy(src_cell.border)
-                dst_cell.fill = copy(src_cell.fill)
-                dst_cell.number_format = src_cell.number_format
-                dst_cell.alignment = copy(src_cell.alignment)
-                dst_cell.protection = copy(src_cell.protection)
+                # Копируем весь стиль одним массивом индексов. Прежний вариант
+                # (copy() на font/border/fill/alignment/protection) для каждого
+                # стиля делал XML-сериализацию и обратный разбор (~80 мкс),
+                # т.е. ~0.5 мс на ячейку. StyleArray живёт в той же книге,
+                # поэтому индексы стилей валидны.
+                dst_cell._style = StyleArray(src_cell._style)
             if src_cell.hyperlink:
                 dst_cell.hyperlink = src_cell.hyperlink
         if old_row in row_props:
@@ -348,14 +445,21 @@ def sort_filial_blocks_by_overdue(ws):
             rd.outlineLevel = outline
             rd.collapsed = collapsed
 
-    # Восстанавливаем объединённые ячейки на новых местах
+    # Восстанавливаем объединённые ячейки на новых местах.
+    # ws.merge_cells() для каждого диапазона выполняет проверку пересечений O(M),
+    # что даёт O(M²) на лист. Диапазоны заведомо не пересекаются (они были
+    # корректными объединениями и переносятся целиком внутри своих блоков),
+    # поэтому используем add_merged_range_fast без квадратичной проверки.
     for rng, delta in merge_map:
-        ws.merge_cells(
-            start_row=rng.min_row + delta,
-            start_column=rng.min_col,
-            end_row=rng.max_row + delta,
-            end_column=rng.max_col
-        )
+        new_coord = CellRange(
+            min_row=rng.min_row + delta,
+            min_col=rng.min_col,
+            max_row=rng.max_row + delta,
+            max_col=rng.max_col,
+        ).coord
+        add_merged_range_fast(ws, new_coord, existing_ranges=kept_merge_ranges)
+    # Позиции объединений изменились — кэш карты ячеек больше не актуален
+    _invalidate_merged_cells_cache(ws)
 
     # Диагностика: фактический порядок строк подразделений после перестановки
     order_lines = []
@@ -489,59 +593,66 @@ def recalc_totals(ws):
             leaves.add(row)
     logger.info(f"Листьев: {len(leaves)}")
 
-    def get_all_leaves_under(row):
-        node = nodes.get(row)
-        if not node:
-            return set()
-        if row in leaves:
-            return {row}
-        result = set()
-        for child in node['children']:
-            result |= get_all_leaves_under(child)
-        return result
+    # Агрегаты считаются один раз — снизу вверх. Листья читаются из файла, а
+    # родительские строки суммируют уже готовые суммы детей.
+    # Прежняя реализация для КАЖДОГО узла заново обходила всё его поддерево
+    # листьев (и на каждое чтение ячейки линейно искала объединения), что на
+    # реестре ~3500 строк занимало десятки секунд.
+    sums = {}         # row -> {col: сумма}
+    max_days = {}     # row -> максимум по колонке «дней»
+    leaf_counts = {}  # row -> количество листьев в поддереве
 
-    def sum_leaves(leaf_set, col):
-        total = 0
-        for r in leaf_set:
-            val = get_cell_value(ws, r, col)
-            if isinstance(val, (int, float)):
-                total += val
-        return total
+    for row in leaves:
+        sums[row] = {col: _row_to_float(get_cell_value(ws, row, col)) for col in SUM_COLUMNS}
+        max_days[row] = _row_to_float(get_cell_value(ws, row, COLUMNS['DAYS']))
+        leaf_counts[row] = 1
 
-    def max_days_in_leaf_set(leaf_set):
-        max_val = 0
-        for r in leaf_set:
-            val = get_cell_value(ws, r, COLUMNS['DAYS'])
-            if isinstance(val, (int, float)) and val > max_val:
-                max_val = val
-        return max_val
-
+    # Обход в порядке убывания строк: дети всегда имеют номер больше родителя,
+    # поэтому к моменту обработки узла агрегаты всех его детей уже посчитаны.
     sorted_rows = sorted(nodes.keys(), reverse=True)
     recalculated_count = 0
     for row in sorted_rows:
         node = nodes[row]
-        if row in leaves:
-            continue
-        leaf_set = get_all_leaves_under(row)
-        if not leaf_set:
+        if not node['children']:
             continue
         recalculated_count += 1
+        agg = {col: 0 for col in SUM_COLUMNS}
+        max_day = 0
+        leaf_count = 0
+        for child in node['children']:
+            child_sums = sums.get(child)
+            if child_sums:
+                for col in SUM_COLUMNS:
+                    agg[col] += child_sums[col]
+            child_days = max_days.get(child, 0)
+            if child_days > max_day:
+                max_day = child_days
+            leaf_count += leaf_counts.get(child, 0)
+        sums[row] = agg
+        max_days[row] = max_day
+        leaf_counts[row] = leaf_count
+        # Округляем до копеек: суммы — денежные величины, формат '#,##0.00'
         for col in SUM_COLUMNS:
-            total = sum_leaves(leaf_set, col)
-            safe_set_number_format(ws, row, col, total)
-        max_day = max_days_in_leaf_set(leaf_set)
+            safe_set_number_format(ws, row, col, round(agg[col], 2))
         safe_set_value(ws, row, COLUMNS['DAYS'], max_day)
     logger.info(f"Пересчитано узлов: {recalculated_count}")
 
     if total_row and filial_rows:
-        all_leaves_under_filials = set()
+        agg = {col: 0 for col in SUM_COLUMNS}
+        max_day = 0
+        leaf_count = 0
         for fil_row in filial_rows:
-            all_leaves_under_filials |= get_all_leaves_under(fil_row)
-        logger.info(f"Общий итог стр.{total_row}: {len(all_leaves_under_filials)} листьев под филиалами")
+            fil_sums = sums.get(fil_row)
+            if fil_sums:
+                for col in SUM_COLUMNS:
+                    agg[col] += fil_sums[col]
+            fil_days = max_days.get(fil_row, 0)
+            if fil_days > max_day:
+                max_day = fil_days
+            leaf_count += leaf_counts.get(fil_row, 0)
+        logger.info(f"Общий итог стр.{total_row}: {leaf_count} листьев под филиалами")
         for col in SUM_COLUMNS:
-            total = sum_leaves(all_leaves_under_filials, col)
-            safe_set_number_format(ws, total_row, col, total)
-        max_day = max_days_in_leaf_set(all_leaves_under_filials)
+            safe_set_number_format(ws, total_row, col, round(agg[col], 2))
         safe_set_value(ws, total_row, COLUMNS['DAYS'], max_day)
     logger.info("=== ПЕРЕСЧЁТ ИТОГОВ ЗАВЕРШЁН ===")
 
@@ -576,20 +687,22 @@ def update_top_table(ws, total_row):
 def copy_worksheet_full(ws, wb):
     logger.info(f"Копирование ячеек листа '{ws.title}'...")
     new_ws = wb.create_sheet(ws.title)
-    for row in ws.iter_rows():
-        for cell in row:
-            new_cell = new_ws.cell(row=cell.row, column=cell.column, value=cell.value)
-            if cell.has_style:
-                new_cell.font = copy(cell.font)
-                new_cell.border = copy(cell.border)
-                new_cell.fill = copy(cell.fill)
-                new_cell.number_format = cell.number_format
-                new_cell.alignment = copy(cell.alignment)
-                new_cell.protection = copy(cell.protection)
-            if cell.data_type == 'f':
-                new_cell.data_type = 'f'
-    for merged_range in ws.merged_cells.ranges:
-        new_ws.merge_cells(str(merged_range))
+    # Копируем только реально существующие ячейки. ws.iter_rows() создаёт
+    # Cell-объекты на всей прямоугольной области (включая пустые) — для
+    # широких листов это лишняя работа и мусор в выходном файле.
+    for (row, col), cell in ws._cells.items():
+        new_cell = new_ws.cell(row=row, column=col, value=cell.value)
+        if cell.has_style:
+            # Без copy(): openpyxl реализует __copy__ стилей через XML
+            # (to_tree + from_tree) — это ~80 мкс на объект и 6 объектов на
+            # ячейку.
+            copy_cell_style(cell, new_cell)
+        if cell.data_type == 'f':
+            new_cell.data_type = 'f'
+    # Объединения исходного листа непересекающиеся — добавляем их без
+    # квадратичной проверки пересечений
+    for merged_range in list(ws.merged_cells.ranges):
+        add_merged_range_fast(new_ws, str(merged_range))
     for col_letter, col_dim in ws.column_dimensions.items():
         new_ws.column_dimensions[col_letter].width = col_dim.width
         if col_dim.outline_level:
@@ -1192,7 +1305,7 @@ def build_email_data(data, current_day_data, total_debt, total_overdue, siuat_to
     summary_dt_rows = [
         {'label': 'общая ДЗ', 'value': _fmt(total_debt)},
         {'label': 'из них ПДЗ', 'value': _fmt(total_overdue)},
-        {'label': 'Судебная задолженность (Промстрой, АккаунтЭксперт, МКСталь)', 'value': _fmt(summary_dt.get('legal', 0))},
+        {'label': 'Судебная задолженность (Промстрой, АккаунтЭксперт, МКСталь, Кройл)', 'value': _fmt(summary_dt.get('legal', 0))},
     ]
 
     summary_siuat_rows = [
@@ -1307,7 +1420,7 @@ def create_summary_sheet(ws, data, total_debt=0, total_overdue=0, siuat_total_de
     rows_dt = [
         ('общая ДЗ', total_debt),
         ('из них ПДЗ', total_overdue),
-        ('Судебная задолженность (Промстрой, АккаунтЭксперт, МКСталь)', summary_dt.get('legal', 0)),
+        ('Судебная задолженность (Промстрой, АккаунтЭксперт, МКСталь, Кройл)', summary_dt.get('legal', 0)),
     ]
     for label, value in rows_dt:
         cl = ws.cell(row=row, column=1, value=label)
@@ -2471,6 +2584,17 @@ def _pl_parse_ref(ref):
     return (m.group(1), int(m.group(2))) if m else (None, None)
 
 
+def _pl_rel_map(rels_xml):
+    """Карта связей Id → Target (порядок атрибутов в файле может быть любым)."""
+    result = {}
+    for tag in re.findall(r'<Relationship\b[^>]*/>', rels_xml or ''):
+        rid = re.search(r'\bId="([^"]+)"', tag)
+        target = re.search(r'\bTarget="([^"]+)"', tag)
+        if rid and target:
+            result[rid.group(1)] = target.group(1)
+    return result
+
+
 def _pl_resolve_sheet_path(zf, sheet_name=None):
     """Путь XML нужного листа внутри архива (по имени, иначе — первый лист)."""
     try:
@@ -2488,7 +2612,7 @@ def _pl_resolve_sheet_path(zf, sheet_name=None):
     if not pairs:
         return 'xl/worksheets/sheet1.xml'
 
-    rel_map = dict(re.findall(r'<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"', rels_xml))
+    rel_map = _pl_rel_map(rels_xml)
     target_id = None
     if sheet_name:
         for name, rid in pairs:
@@ -2502,55 +2626,183 @@ def _pl_resolve_sheet_path(zf, sheet_name=None):
     return target if target.startswith('xl/') else 'xl/' + target
 
 
-def _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name=None):
-    """Удаляет строки (1-based, как в Excel) из листа xlsx.
+_PL_MERGE_ELEM_RE = re.compile(r'<mergeCell\b[^>]*?/>')
+_PL_MERGE_CELLS_RE = re.compile(r'<mergeCells\b[^>]*>.*?</mergeCells>', re.S)
 
-    raw — байты исходного .xlsx; возвращает (BytesIO с готовым файлом, info).
-    """
-    # Мусор в списке строк игнорируем, строку 1 (шапку) не удаляем
+
+def _pl_clean_remove_rows(remove_rows, protect_upto=1):
+    """Убирает мусор из списка строк (1-based) и защищает строки 1..protect_upto (шапку)."""
     clean_rows = []
     for value in (remove_rows or []):
         try:
             num = int(str(value).strip())
         except (TypeError, ValueError):
             continue
-        if num > 1:
+        if num > protect_upto:
             clean_rows.append(num)
-    remove_rows = sorted(set(clean_rows))
+    return sorted(set(clean_rows))
 
-    with zipfile.ZipFile(io.BytesIO(raw)) as z:
-        infos = z.infolist()
-        data = {i.filename: z.read(i.filename) for i in infos}
-        sheet_path = _pl_resolve_sheet_path(z, sheet_name)
 
-    if not remove_rows:
-        return io.BytesIO(raw), {'removed': 0, 'sheet': sheet_path, 'rows_left': None,
-                                 'byte_identical': True, 'warning': ''}
+def _pl_shift_row(num, remove_rows):
+    """Номер строки после удаления: вычитаем все удалённые строки, стоящие выше."""
+    return num - sum(1 for d in remove_rows if d < num)
 
-    if sheet_path not in data:
-        raise ValueError('В файле не найден лист с данными')
 
-    xml = data[sheet_path].decode('utf-8')
+def _pl_cell_xml(ref, style, value):
+    """XML ячейки с текстом (стиль — номер оформления из книги)."""
+    attrs = f' s="{style}"' if style else ''
+    return (f'<c r="{ref}"{attrs} t="inlineStr">'
+            f'<is><t xml:space="preserve">{_pl_xml_escape(value)}</t></is></c>')
+
+
+def _pl_set_cell_value(body, column, row_num, value):
+    """Меняет текст одной ячейки в теле строки, сохраняя её оформление.
+
+    Если ячейки в строке нет — создаёт её в нужном месте (стиль берётся у соседней слева).
+    """
+    ref = f'{column}{row_num}'
+    safe_col = re.escape(column)
+    style = ''
+
+    # 1) Пустая ячейка вида <c r="M5" s="7"/>
+    empty_match = re.search(rf'<c r="{safe_col}{row_num}"[^>]*/>', body)
+    # 2) Ячейка со значением вида <c r="M5" s="7" t="s"><v>3</v></c>
+    filled_match = re.search(rf'<c r="{safe_col}{row_num}"[^>]*>(?:(?!<c ).)*?</c>', body, re.S)
+
+    match = filled_match or empty_match
+    if match:
+        style_match = re.search(r'\bs="(\d+)"', match.group(0))
+        if style_match:
+            style = style_match.group(1)
+        return body[:match.start()] + _pl_cell_xml(ref, style, value) + body[match.end():]
+
+    # 3) Ячейки нет — создаём: ищем место по номеру колонки и берём стиль соседа слева
+    own_index = openpyxl.utils.column_index_from_string(column)
+    insert_at, neighbour_style = None, ''
+    for cell_match in re.finditer(r'<c r="([A-Z]{1,3})\d+"[^>]*>', body):
+        tag = cell_match.group(0)
+        try:
+            cell_index = openpyxl.utils.column_index_from_string(cell_match.group(1))
+        except ValueError:
+            continue
+        if cell_index < own_index:
+            style_match = re.search(r'\bs="(\d+)"', tag)
+            if style_match:
+                neighbour_style = style_match.group(1)
+            continue
+        insert_at = cell_match.start()
+        break
+    new_cell = _pl_cell_xml(ref, neighbour_style, value)
+    if insert_at is None:
+        return body + new_cell
+    return body[:insert_at] + new_cell + body[insert_at:]
+
+
+def _pl_set_sheet_cells(xml, edits):
+    """Записывает новые значения в ячейки листа: edits = {номер строки: {колонка: текст}}."""
+    if not edits:
+        return xml
+
+    def fix_row(match):
+        row_num = int(match.group(1))
+        row_edits = edits.get(row_num)
+        if not row_edits:
+            return match.group(0)
+        block = match.group(0)
+        tag_end = block.index('>')
+        open_tag, body = block[:tag_end + 1], block[tag_end + 1:]
+        for column, value in row_edits.items():
+            body = _pl_set_cell_value(body, column, row_num, value)
+        return open_tag + body
+
+    return _PL_ROW_RE.sub(fix_row, xml)
+
+
+def _pl_build_cell_edits(row_edits, columns):
+    """Правки «Тип оплаты»/«Детальный лимит» из браузера → {строка: {колонка: текст}}."""
+    if not isinstance(row_edits, dict) or not isinstance(columns, dict):
+        return {}
+    result = {}
+    for row_key, edit in row_edits.items():
+        try:
+            row_num = int(str(row_key).strip())
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(edit, dict):
+            continue
+        cells = {}
+        for field in ('category', 'detail'):
+            column = str(columns.get(field) or '').strip().upper()
+            if not re.fullmatch(r'[A-Z]{1,3}', column) or field not in edit:
+                continue
+            cells[column] = '' if edit.get(field) is None else str(edit.get(field))
+        if cells:
+            result[row_num] = cells
+    return result
+
+
+def _pl_shift_merges(xml, remove_rows):
+    """Переносит объединённые ячейки вместе со строками; полностью удалённые убирает."""
+    if '<mergeCell' not in xml:
+        return xml
+
+    def fix(mm):
+        elem = mm.group(0)
+        ref = re.search(r'\bref="([A-Z]+\d+):([A-Z]+\d+)"', elem)
+        if not ref:
+            return elem
+        ca, ra = _pl_parse_ref(ref.group(1))
+        cb, rb = _pl_parse_ref(ref.group(2))
+        if ra is None or rb is None:
+            return elem
+        if not any(ra <= d <= rb for d in remove_rows):
+            return elem
+        ns = ra - sum(1 for d in remove_rows if d < ra)
+        ne = rb - sum(1 for d in remove_rows if d <= rb)
+        if ne < ns:
+            return ''
+        new_ref = f'{ca}{ns}' if ns == ne else f'{ca}{ns}:{cb}{ne}'
+        return elem.replace(f'ref="{ref.group(1)}:{ref.group(2)}"', f'ref="{new_ref}"')
+
+    xml = _PL_MERGE_ELEM_RE.sub(fix, xml)
+
+    def fix_count(mm):
+        body = mm.group(0)
+        count = body.count('<mergeCell ')
+        if not count:
+            return ''
+        return re.sub(r'<mergeCells\b[^>]*>', f'<mergeCells count="{count}">', body, count=1)
+
+    return _PL_MERGE_CELLS_RE.sub(fix_count, xml)
+
+
+def _pl_filter_rows_xml(xml, remove_rows):
+    """Удаляет строки из XML листа с перенумерацией строк и адресов ячеек (как это делает Excel).
+
+    Возвращает (новый XML, info). Если удалять нечего — XML отдаётся без изменений.
+    """
+    remove_rows = sorted(set(remove_rows or []))
+    row_matches = list(_PL_ROW_RE.finditer(xml))
     warnings = []
     if _PL_FORMULA_RE.search(xml):
         warnings.append('в листе есть формулы — ссылки при удалении строк не пересчитываются')
     if _PL_MERGE_RE.search(xml):
-        warnings.append('в листе есть объединённые ячейки — проверьте их после выгрузки')
+        warnings.append('в листе есть объединённые ячейки — они перенесены вместе со строками')
+    last_row = max((int(m.group(1)) for m in row_matches), default=1)
 
-    def shift(r):
-        return r - sum(1 for d in remove_rows if d < r)
-
-    # 1. Удаление строк + перенумерация строк и адресов ячеек
-    row_matches = list(_PL_ROW_RE.finditer(xml))
+    if not remove_rows:
+        return xml, {'removed': 0, 'rows_left': last_row,
+                     'warning': '; '.join(warnings), 'changed': False}
     if not row_matches:
         raise ValueError('В листе не найдено строк для обработки')
 
+    # 1. Удаление строк + перенумерация строк и адресов ячеек
     parts, kept_numbers = [], []
     for m in row_matches:
         num = int(m.group(1))
         if num in remove_rows:
             continue
-        new_num = shift(num)
+        new_num = _pl_shift_row(num, remove_rows)
         kept_numbers.append(new_num)
         block = m.group(0)
         tag_end = block.index('>')
@@ -2568,7 +2820,7 @@ def _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name=None):
             lambda mm: f'{mm.group(1)}{mm.group(2)}{mm.group(3)}:{mm.group(4)}{new_last}{mm.group(6)}',
             xml)
 
-    # 3. Условное форматирование — сдвигаем/обрезаем диапазоны, как Excel
+    # 3. Условное форматирование — диапазоны сдвигаются так же, как при удалении строк в Excel
     if _PL_CF_RE.search(xml):
         def fix_cf(mm):
             sqref = mm.group(1)
@@ -2580,45 +2832,708 @@ def _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name=None):
                 if ra is None or rb is None:
                     new_ranges.append(rng)
                     continue
-                if any(ra <= d <= rb for d in remove_rows):
-                    ns = ra - sum(1 for d in remove_rows if d < ra)
-                    ne = rb - sum(1 for d in remove_rows if d <= rb)
-                    if ne < ns:
-                        continue  # диапазон полностью удалён
-                    new_ranges.append(f'{ca}{ns}' if ns == ne else f'{ca}{ns}:{cb}{ne}')
-                else:
-                    new_ranges.append(rng)
+                ns = ra - sum(1 for d in remove_rows if d < ra)
+                ne = rb - sum(1 for d in remove_rows if d <= rb)
+                if ne < ns:
+                    continue  # диапазон полностью удалён
+                new_ranges.append(f'{ca}{ns}' if ns == ne else f'{ca}{ns}:{cb}{ne}')
             if not new_ranges:
                 return ''
             return mm.group(0).replace(f'sqref="{sqref}"', 'sqref="' + ' '.join(new_ranges) + '"')
         xml = _PL_CF_RE.sub(fix_cf, xml)
 
-    # 4. Автофильтр — подрезаем по числу удалённых строк внутри диапазона
+    # 4. Автофильтр — тоже переносим на оставшиеся строки
     if _PL_AF_RE.search(xml):
         def fix_af(mm):
             start, end = int(mm.group(3)), int(mm.group(5))
-            new_end = end - sum(1 for d in remove_rows if start <= d <= end)
-            if new_end < 1:
+            new_start = start - sum(1 for d in remove_rows if d < start)
+            new_end = end - sum(1 for d in remove_rows if d <= end)
+            if new_end < 1 or new_start < 1:
                 return mm.group(0)
-            return f'{mm.group(1)}{mm.group(2)}{start}:{mm.group(4)}{new_end}{mm.group(6)}'
+            return f'{mm.group(1)}{mm.group(2)}{new_start}:{mm.group(4)}{new_end}{mm.group(6)}'
         xml = _PL_AF_RE.sub(fix_af, xml)
 
+    # 5. Объединённые ячейки — переносим вместе со строками
+    xml = _pl_shift_merges(xml, remove_rows)
+
+    return xml, {'removed': len(remove_rows), 'rows_left': new_last,
+                 'warning': '; '.join(warnings), 'changed': True}
+
+
+def _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name=None, protect_upto=1, cell_edits=None):
+    """Удаляет строки (1-based, как в Excel) из листа xlsx.
+
+    raw — байты исходного .xlsx; возвращает (BytesIO с готовым файлом, info).
+    Строки 1..protect_upto считаются шапкой и не удаляются (по умолчанию — только строка 1).
+    cell_edits — правки ячеек {номер строки: {колонка: текст}} («Тип оплаты», «Детальный лимит»).
+    """
+    remove_rows = _pl_clean_remove_rows(remove_rows, protect_upto)
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        infos = z.infolist()
+        data = {i.filename: z.read(i.filename) for i in infos}
+        sheet_path = _pl_resolve_sheet_path(z, sheet_name)
+
+    if not remove_rows and not cell_edits:
+        return io.BytesIO(raw), {'removed': 0, 'sheet': sheet_path, 'rows_left': None,
+                                 'byte_identical': True, 'warning': ''}
+
+    if sheet_path not in data:
+        raise ValueError('В файле не найден лист с данными')
+
+    xml = _pl_set_sheet_cells(data[sheet_path].decode('utf-8'), cell_edits)
+    xml, info = _pl_filter_rows_xml(xml, remove_rows)
     data[sheet_path] = xml.encode('utf-8')
 
-    # 5. Пересборка архива: тот же порядок записей и способ сжатия
+    # Пересборка архива: тот же порядок записей и способ сжатия
     out = io.BytesIO()
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-        for info in infos:
-            zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
-            zi.compress_type = info.compress_type
-            zi.external_attr = info.external_attr
-            zi.internal_attr = info.internal_attr
-            zi.create_system = info.create_system
-            zi.flag_bits = info.flag_bits & ~0x08
-            z.writestr(zi, data[info.filename])
+        for entry in infos:
+            zi = zipfile.ZipInfo(entry.filename, date_time=entry.date_time)
+            zi.compress_type = entry.compress_type
+            zi.external_attr = entry.external_attr
+            zi.internal_attr = entry.internal_attr
+            zi.create_system = entry.create_system
+            zi.flag_bits = entry.flag_bits & ~0x08
+            z.writestr(zi, data[entry.filename])
     out.seek(0)
-    return out, {'removed': len(remove_rows), 'sheet': sheet_path, 'rows_left': new_last,
-                 'byte_identical': False, 'warning': '; '.join(warnings)}
+    return out, {'removed': info['removed'], 'sheet': sheet_path, 'rows_left': info['rows_left'],
+                 'byte_identical': False, 'warning': info['warning']}
+
+
+# ============================================================
+# ЭКСПОРТ РЕЕСТРА «ЛИМИТЫ ПЛАТЕЖЕЙ» ПО ВКЛАДКАМ-КАТЕГОРИЯМ
+# ============================================================
+# Первая вкладка «Общий свод» — весь список платежей без сводной таблицы.
+# Далее один и тот же исходный лист копируется столько раз, сколько категорий
+# встретилось в колонке «Группа» (в образце — колонка O). Строки каждой копии —
+# только платежи своей категории (шапка сохраняется), под данными дописывается
+# сводная таблица блока «Пояснения». Оформление исходника (шрифты, заливки, форматы,
+# ширины, условное форматирование, настройки печати) не пересобирается, а копируется.
+_PL_GROUP_CATEGORIES = [
+    'Филиалы',
+    'УК',
+    'Питание, проживание, связь',
+    'Оплаты в рамках 100 т.р.',
+    'Непереносимые оплаты',
+    'Графики',
+    'Согласовано в оплату',
+    'Кузьмина'
+]
+# Вкладка для платежей, у которых в колонке «Группа» нет знакомого названия
+_PL_GROUP_OTHER = 'Прочее (не сопоставлено)'
+# Вкладка со всем списком платежей (идёт первой, без сводной таблицы)
+_PL_GROUP_ALL = 'Общий свод'
+# Сколько пустых строк оставляем между данными и сводной таблицей (как в «Оплатах поставщикам»)
+_PL_PIVOT_GAP = 4
+_PL_SHEET_NAME_LIMIT = 31
+_PL_SHEET_BAD_CHARS = re.compile(r'[\[\]\*\?/\\:]')
+_PL_PIVOT_SUB_WIDTH = 18
+_PL_PIVOT_EXP_WIDTH = 50
+
+
+def _pl_xml_escape(text):
+    """Текст → XML (как в файле Excel)."""
+    return (str('' if text is None else text).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;'))
+
+
+def _pl_letter(index):
+    """Номер колонки → буква: 1 → A, 27 → AA."""
+    return openpyxl.utils.get_column_letter(max(int(index), 1))
+
+
+def _pl_num_text(value):
+    """Число для ячейки Excel (без лишних знаков после запятой)."""
+    try:
+        num = float(value or 0)
+    except (TypeError, ValueError):
+        num = 0.0
+    if num == int(num):
+        return str(int(num))
+    return ('%.2f' % num)
+
+
+def _pl_fold(text):
+    """Сравнение названий: без учёта регистра и «ё/е» — как в интерфейсе."""
+    return str('' if text is None else text).strip().lower().replace('ё', 'е')
+
+
+def _pl_norm_group(raw):
+    """Название категории по значению колонки «Группа» (те же правила, что на экране)."""
+    s = _pl_fold(raw)
+    if not s:
+        return ''
+    for name in _PL_GROUP_CATEGORIES:
+        if _pl_fold(name) == s:
+            return name
+    for name in _PL_GROUP_CATEGORIES:
+        n = _pl_fold(name)
+        if n and (n in s or s in n):
+            return name
+    return ''
+
+
+def _pl_group_column_index(headers):
+    """Номер колонки «Группа» (0-based): по названию, иначе — самая правая колонка."""
+    for index, header in enumerate(headers):
+        if _pl_fold(header) == 'группа':
+            return index
+    for index, header in enumerate(headers):
+        if 'групп' in _pl_fold(header):
+            return index
+    return max(len(headers) - 1, 0)
+
+
+def _pl_read_row_groups(raw, sheet_name, xml_last_row):
+    """Читает лист: строка шапки, значения колонки «Группа» по строкам, непустые строки."""
+    workbook = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    try:
+        name = sheet_name if sheet_name in workbook.sheetnames else workbook.sheetnames[0]
+        sheet = workbook[name]
+        header_row, headers, group_col = None, [], None
+        group_by_row, nonempty_rows = {}, set()
+        for index, values in enumerate(
+                sheet.iter_rows(min_row=1, max_row=max(int(xml_last_row), 1), values_only=True), start=1):
+            has_value = any(v is not None and str(v).strip() != '' for v in values)
+            if header_row is None:
+                if not has_value:
+                    continue
+                header_row = index
+                headers = ['' if v is None else str(v).strip() for v in values]
+                group_col = _pl_group_column_index(headers)
+                continue
+            if not has_value:
+                continue
+            nonempty_rows.add(index)
+            raw_group = values[group_col] if group_col is not None and group_col < len(values) else ''
+            group_by_row[index] = _pl_norm_group(raw_group)
+    finally:
+        workbook.close()
+    return {'header_row': header_row or 1, 'headers': headers, 'group_col': group_col,
+            'group_by_row': group_by_row, 'nonempty_rows': nonempty_rows}
+
+
+def _pl_insert_before_first(xml, element, anchors):
+    """Вставляет кусок XML перед первым из указанных тегов (порядок тегов в листе важен)."""
+    position = -1
+    for anchor in anchors:
+        found = xml.find(anchor)
+        if found != -1 and (position == -1 or found < position):
+            position = found
+    if position == -1:
+        return xml
+    return xml[:position] + element + xml[position:]
+
+
+# Теги, после которых в XML листа обязаны идти объединённые ячейки
+_PL_AFTER_SHEETDATA_ANCHORS = (
+    '<conditionalFormatting', '<dataValidations', '<hyperlinks', '<printOptions',
+    '<pageMargins', '<pageSetup', '<headerFooter', '<drawing', '<legacyDrawing', '</worksheet>'
+)
+
+
+def _pl_insert_merge(xml, ref):
+    """Добавляет объединённую ячейку (ref) в лист."""
+    if '<mergeCells' in xml:
+        match = _PL_MERGE_CELLS_RE.search(xml)
+        if match:
+            body = match.group(0)
+            count = body.count('<mergeCell ')
+            new_body = body.replace('</mergeCells>', f'<mergeCell ref="{ref}"/></mergeCells>')
+            new_body = re.sub(r'<mergeCells\b[^>]*>', f'<mergeCells count="{count + 1}">', new_body, count=1)
+            return xml[:match.start()] + new_body + xml[match.end():]
+    element = f'<mergeCells count="1"><mergeCell ref="{ref}"/></mergeCells>'
+    return _pl_insert_before_first(xml, element, _PL_AFTER_SHEETDATA_ANCHORS)
+
+
+def _pl_add_cols(xml, col_from, col_to, width):
+    """Задаёт ширину колонок, которых нет в исходном оформлении (исходные не трогаем)."""
+    if col_to < col_from:
+        return xml
+    cols_match = re.search(r'<cols>.*?</cols>', xml, re.S)
+    covered = set()
+    if cols_match:
+        for col_tag in re.findall(r'<col\b[^>]*/>', cols_match.group(0)):
+            min_attr = re.search(r'\bmin="(\d+)"', col_tag)
+            max_attr = re.search(r'\bmax="(\d+)"', col_tag)
+            if min_attr and max_attr:
+                covered.update(range(int(min_attr.group(1)), int(max_attr.group(1)) + 1))
+
+    pieces, run_start = [], None
+    for column in range(col_from, col_to + 1):
+        if column in covered:
+            if run_start is not None:
+                pieces.append((run_start, column - 1))
+                run_start = None
+        elif run_start is None:
+            run_start = column
+    if run_start is not None:
+        pieces.append((run_start, col_to))
+    if not pieces:
+        return xml
+
+    fragment = ''.join(f'<col min="{a}" max="{b}" width="{width}" customWidth="1"/>' for a, b in pieces)
+    if cols_match:
+        insert_at = cols_match.end() - len('</cols>')
+        return xml[:insert_at] + fragment + xml[insert_at:]
+    return _pl_insert_before_first(xml, f'<cols>{fragment}</cols>', ('<sheetData',))
+
+
+def _pl_safe_sheet_name(name, used):
+    """Имя вкладки, допустимое для Excel: без служебных символов, не длиннее 31 знака, уникальное."""
+    clean = _PL_SHEET_BAD_CHARS.sub(' ', str(name or '').strip())
+    clean = re.sub(r'\s+', ' ', clean).strip(" '")
+    if not clean:
+        clean = 'Лист'
+    if len(clean) > _PL_SHEET_NAME_LIMIT:
+        clean = clean[:_PL_SHEET_NAME_LIMIT].strip()
+    candidate, suffix = clean, 2
+    while candidate.lower() in used:
+        tail = f' ({suffix})'
+        candidate = clean[:_PL_SHEET_NAME_LIMIT - len(tail)].strip() + tail
+        suffix += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _pl_workbook_sheets(wb_xml, rels_xml):
+    """Список листов книги: [(имя, sheetId, rId, путь XML)] в порядке книги."""
+    rel_map = _pl_rel_map(rels_xml)
+    result = []
+    for match in re.finditer(r'<sheet\b[^>]*/>', wb_xml):
+        tag = match.group(0)
+        name_attr = re.search(r'\bname="([^"]*)"', tag)
+        rid_attr = re.search(r'\br:id="([^"]*)"', tag)
+        id_attr = re.search(r'\bsheetId="(\d+)"', tag)
+        if not (name_attr and rid_attr):
+            continue
+        target = rel_map.get(rid_attr.group(1), '').lstrip('/')
+        path = target if target.startswith('xl/') else 'xl/' + target
+        sheet_id = int(id_attr.group(1)) if id_attr else len(result) + 1
+        result.append((_pl_html_unescape(name_attr.group(1)), sheet_id, rid_attr.group(1), path))
+    return result
+
+
+def _pl_update_app_xml(app_xml, sheet_names):
+    """Обновляет список листов в свойствах файла (docProps/app.xml)."""
+    names_xml = ''.join(f'<vt:lpstr>{_pl_xml_escape(name)}</vt:lpstr>' for name in sheet_names)
+    titles = (f'<TitlesOfParts><vt:vector size="{len(sheet_names)}" baseType="lpstr">'
+              f'{names_xml}</vt:vector></TitlesOfParts>')
+    app_xml = re.sub(r'<TitlesOfParts>.*?</TitlesOfParts>', titles, app_xml, flags=re.S)
+    if '<HeadingPairs>' in app_xml:
+        headings = ('<HeadingPairs><vt:vector size="2" baseType="variant">'
+                    '<vt:variant><vt:lpstr>Листы</vt:lpstr></vt:variant>'
+                    f'<vt:variant><vt:i4>{len(sheet_names)}</vt:i4></vt:variant>'
+                    '</vt:vector></HeadingPairs>')
+        app_xml = re.sub(r'<HeadingPairs>.*?</HeadingPairs>', headings, app_xml, flags=re.S)
+    return app_xml
+
+
+def _pl_pivot_styles(styles_xml):
+    """Добавляет в стили книги оформление сводного блока. Возвращает (XML, номера стилей)."""
+    xml = styles_xml
+
+    def append_items(text, tag, items):
+        count_match = re.search(rf'<{tag}\b[^>]*\bcount="(\d+)"', text)
+        end = text.find(f'</{tag}>')
+        if end == -1:
+            return text, None
+        base = int(count_match.group(1)) if count_match else 0
+        text = text[:end] + ''.join(items) + text[end:]
+        if count_match:
+            text = (text[:count_match.start()] + f'<{tag} count="{base + len(items)}"'
+                    + text[count_match.end():])
+        return text, base
+
+    fonts = [
+        # заголовок над таблицей
+        '<font><b/><sz val="14"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>',
+        # шапка таблицы — белый жирный
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>',
+        # строка ИТОГО
+        '<font><b/><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>'
+    ]
+    fills = [
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill>',
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/><bgColor indexed="64"/></patternFill></fill>',
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>'
+    ]
+    xml, font_base = append_items(xml, 'fonts', fonts)
+    xml, fill_base = append_items(xml, 'fills', fills)
+    if font_base is None or fill_base is None:
+        return styles_xml, None
+    font_title, font_header, font_bold = font_base, font_base + 1, font_base + 2
+    fill_blue, fill_yellow, fill_green = fill_base, fill_base + 1, fill_base + 2
+
+    # Тонкая рамка: берём готовую из книги, иначе добавляем свою
+    thin_border = None
+    border_count = 0
+    borders_match = re.search(r'<borders\b[^>]*>.*?</borders>', xml, re.S)
+    if borders_match:
+        border_items = re.findall(r'<border\b[^>]*>.*?</border>|<border\b[^>]*/>',
+                                  borders_match.group(0), re.S)
+        border_count = len(border_items)
+        for index, item in enumerate(border_items):
+            if all(re.search(rf'<{side}\b[^>]*style="thin"', item)
+                   for side in ('left', 'right', 'top', 'bottom')):
+                thin_border = index
+                break
+    if thin_border is None:
+        border = ('<border><left style="thin"><color indexed="64"/></left>'
+                  '<right style="thin"><color indexed="64"/></right>'
+                  '<top style="thin"><color indexed="64"/></top>'
+                  '<bottom style="thin"><color indexed="64"/></bottom><diagonal/></border>')
+        xml, border_base = append_items(xml, 'borders', [border])
+        if border_base is None:
+            return styles_xml, None
+        thin_border = border_count or border_base
+
+    xfs = [
+        # 0 — заголовок над таблицей
+        f'<xf numFmtId="0" fontId="{font_title}" fillId="0" borderId="0" xfId="0" applyFont="1"/>',
+        # 1 — шапка таблицы
+        f'<xf numFmtId="0" fontId="{font_header}" fillId="{fill_blue}" borderId="{thin_border}"'
+        f' xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1">'
+        f'<alignment horizontal="center" vertical="center" wrapText="1"/></xf>',
+        # 2 — название контрагента
+        f'<xf numFmtId="0" fontId="0" fillId="0" borderId="{thin_border}" xfId="0" applyBorder="1"/>',
+        # 3 — название контрагента в подсвеченной (жёлтой) строке
+        f'<xf numFmtId="0" fontId="0" fillId="{fill_yellow}" borderId="{thin_border}" xfId="0"'
+        f' applyFill="1" applyBorder="1"/>',
+        # 4 — число
+        f'<xf numFmtId="4" fontId="0" fillId="0" borderId="{thin_border}" xfId="0"'
+        f' applyNumberFormat="1" applyBorder="1" applyAlignment="1">'
+        f'<alignment horizontal="right" vertical="top"/></xf>',
+        # 5 — число в подсвеченной (жёлтой) строке
+        f'<xf numFmtId="4" fontId="0" fillId="{fill_yellow}" borderId="{thin_border}" xfId="0"'
+        f' applyNumberFormat="1" applyFill="1" applyBorder="1" applyAlignment="1">'
+        f'<alignment horizontal="right" vertical="top"/></xf>',
+        # 6 — «ИТОГО» в первой колонке
+        f'<xf numFmtId="0" fontId="{font_bold}" fillId="{fill_green}" borderId="{thin_border}"'
+        f' xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>',
+        # 7 — число в строке ИТОГО
+        f'<xf numFmtId="4" fontId="{font_bold}" fillId="{fill_green}" borderId="{thin_border}"'
+        f' xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1">'
+        f'<alignment horizontal="right" vertical="top"/></xf>',
+        # 8 — пустая ячейка «Пояснение» в строке ИТОГО
+        f'<xf numFmtId="0" fontId="0" fillId="{fill_green}" borderId="{thin_border}" xfId="0"'
+        f' applyFill="1" applyBorder="1"/>'
+    ]
+    xml, xf_base = append_items(xml, 'cellXfs', xfs)
+    if xf_base is None:
+        return styles_xml, None
+
+    styles = {'title': xf_base, 'header': xf_base + 1, 'name': xf_base + 2, 'name_y': xf_base + 3,
+              'num': xf_base + 4, 'num_y': xf_base + 5, 'total_name': xf_base + 6,
+              'num_total': xf_base + 7, 'text_total': xf_base + 8}
+    return xml, styles
+
+
+def _pl_trim_cf_to_data(xml, last_row):
+    """Не даём условному форматированию исходника заходить на сводную таблицу."""
+    if '<conditionalFormatting' not in xml:
+        return xml
+
+    def fix(mm):
+        sqref = mm.group(1)
+        new_ranges = []
+        for rng in sqref.split(' '):
+            a, _, b = rng.partition(':') if ':' in rng else (rng, ':', rng)
+            ca, ra = _pl_parse_ref(a)
+            cb, rb = _pl_parse_ref(b)
+            if ra is None or rb is None:
+                new_ranges.append(rng)
+                continue
+            if ra > last_row:
+                continue                      # диапазон целиком ниже данных — он бы красил сводную
+            ne = min(rb, last_row)
+            new_ranges.append(f'{ca}{ra}' if ra == ne else f'{ca}{ra}:{cb}{ne}')
+        if not new_ranges:
+            return ''
+        return mm.group(0).replace(f'sqref="{sqref}"', 'sqref="' + ' '.join(new_ranges) + '"')
+
+    return _PL_CF_RE.sub(fix, xml)
+
+
+def _pl_append_pivot_block(xml, pivot, last_row, styles):
+    """Дописывает под данными листа сводную таблицу блока «Пояснения»."""
+    headers = ['' if h is None else str(h) for h in (pivot.get('headers') or [])]
+    items = pivot.get('rows') or []
+    columns = 1 + len(headers) + 2                     # Контрагент + подразделения + Итого + Пояснение
+    title_row = last_row + _PL_PIVOT_GAP
+    header_row = title_row + 2
+    first_data_row = header_row + 1
+    total_row = first_data_row + len(items)
+
+    def row_xml(row_num, cells):
+        return f'<row r="{row_num}" spans="1:{columns}">' + ''.join(cells) + '</row>'
+
+    def cell_text(row_num, col, style, value):
+        text = _pl_xml_escape(value)
+        return (f'<c r="{_pl_letter(col)}{row_num}" s="{style}" t="inlineStr">'
+                f'<is><t xml:space="preserve">{text}</t></is></c>')
+
+    def cell_num(row_num, col, style, value):
+        return f'<c r="{_pl_letter(col)}{row_num}" s="{style}"><v>{_pl_num_text(value)}</v></c>'
+
+    def cell_empty(row_num, col, style):
+        return f'<c r="{_pl_letter(col)}{row_num}" s="{style}"/>'
+
+    rows_xml = [row_xml(title_row, [
+        cell_text(title_row, 1, styles['title'], 'Пояснения: сводная по контрагентам')])]
+
+    header_cells = [cell_text(header_row, 1, styles['header'], 'Контрагент')]
+    for index, header in enumerate(headers, start=2):
+        header_cells.append(cell_text(header_row, index, styles['header'], header))
+    header_cells.append(cell_text(header_row, columns - 1, styles['header'], 'Итого'))
+    header_cells.append(cell_text(header_row, columns, styles['header'], 'Пояснение'))
+    rows_xml.append(row_xml(header_row, header_cells))
+
+    totals = [0.0] * len(headers)
+    grand = 0.0
+    for offset, item in enumerate(items):
+        row_num = first_data_row + offset
+        explanation = str(item.get('explanation') or '')
+        name_style = styles['name_y'] if explanation else styles['name']
+        num_style = styles['num_y'] if explanation else styles['num']
+        values = item.get('values') or []
+        cells = [cell_text(row_num, 1, name_style, item.get('contractor') or '')]
+        row_total = 0.0
+        for index in range(len(headers)):
+            raw_value = values[index] if index < len(values) else 0
+            try:
+                value = float(raw_value or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            totals[index] += value
+            row_total += value
+            cells.append(cell_num(row_num, index + 2, num_style, value))
+        cells.append(cell_num(row_num, columns - 1, num_style, row_total))
+        cells.append(cell_text(row_num, columns, name_style, explanation))
+        grand += row_total
+        rows_xml.append(row_xml(row_num, cells))
+
+    total_cells = [cell_text(total_row, 1, styles['total_name'], 'ИТОГО')]
+    for index, value in enumerate(totals):
+        total_cells.append(cell_num(total_row, index + 2, styles['num_total'], value))
+    total_cells.append(cell_num(total_row, columns - 1, styles['num_total'], grand))
+    total_cells.append(cell_empty(total_row, columns, styles['text_total']))
+    rows_xml.append(row_xml(total_row, total_cells))
+
+    end = xml.rfind('</sheetData>')
+    if end == -1:
+        return xml
+    xml = xml[:end] + ''.join(rows_xml) + xml[end:]
+
+    # Заголовок таблицы — объединённые ячейки по всей её ширине
+    xml = _pl_insert_merge(xml, f'A{title_row}:{_pl_letter(columns)}{title_row}')
+
+    # Подсветка исходника остаётся только на данных — не красит сводную таблицу
+    xml = _pl_trim_cf_to_data(xml, last_row)
+
+    # Ширины колонок правее данных (внутри данных остаются исходные)
+    xml = _pl_add_cols(xml, 2, columns - 1, _PL_PIVOT_SUB_WIDTH)
+    xml = _pl_add_cols(xml, columns, columns, _PL_PIVOT_EXP_WIDTH)
+
+    # dimension — расширяем, если сводная таблица вышла за пределы данных
+    dimension = _PL_DIM_RE.search(xml)
+    if dimension:
+        end_col, end_row = dimension.group(4), int(dimension.group(5))
+        new_end_col = _pl_letter(max(openpyxl.utils.column_index_from_string(end_col), columns))
+        new_end_row = max(end_row, total_row)
+        xml = _PL_DIM_RE.sub(
+            lambda mm: f'{mm.group(1)}{mm.group(2)}{mm.group(3)}:{new_end_col}{new_end_row}{mm.group(6)}',
+            xml)
+    return xml
+
+
+def _pl_tab_rows_by_group(row_info, removed, header_row):
+    """Разбивает строки файла на вкладки: общий список, категории «Пояснений» и «Прочее»."""
+    removed_set = set(removed)
+    kept = [r for r in sorted(row_info['nonempty_rows']) if r > header_row and r not in removed_set]
+    if not kept:
+        return []
+    # Первая вкладка — весь список платежей (сводная таблица на неё не добавляется)
+    tabs = [{'name': _PL_GROUP_ALL, 'rows': kept, 'pivot': False}]
+    categories = []
+    for name in _PL_GROUP_CATEGORIES:
+        rows = [r for r in kept if row_info['group_by_row'].get(r) == name]
+        if rows:
+            categories.append({'name': name, 'rows': rows})
+    tabs.extend(categories)
+    others = [r for r in kept if not row_info['group_by_row'].get(r)]
+    # «Прочее» нужно только тогда, когда есть с чем сравнивать (иначе всё уже в «Общем своде»)
+    if others and categories:
+        tabs.append({'name': _PL_GROUP_OTHER, 'rows': others})
+    return tabs
+
+
+def _pl_pivots_by_name(pivots):
+    """Сводные таблицы из браузера: {название вкладки: описание таблицы}."""
+    result = {}
+    for item in (pivots or []):
+        if isinstance(item, dict) and item.get('name'):
+            result[str(item['name']).strip()] = item
+    return result
+
+
+def _pl_set_sheet_uid(xml):
+    """Делает идентификатор листа уникальным (Excel хранит его для истории правок)."""
+    return re.sub(r'xr:uid="\{[^"]*\}"', f'xr:uid="{{{str(uuid.uuid4()).upper()}}}"', xml, count=1)
+
+
+def _pl_split_sheets_by_group(raw, remove_rows, sheet_name=None, pivots=None, cell_edits=None):
+    """Раскладывает реестр по вкладкам: «Общий свод», категории «Группы» со сводными таблицами.
+
+    cell_edits — правки «Тип оплаты»/«Детальный лимит» (пишутся во все вкладки).
+    Возвращает (BytesIO, info) либо (None, None), если категории определить не удалось.
+    """
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        infos = z.infolist()
+        data = {i.filename: z.read(i.filename) for i in infos}
+        sheet_path = _pl_resolve_sheet_path(z, sheet_name)
+
+    if sheet_path not in data:
+        raise ValueError('В файле не найден лист с данными')
+
+    sheet_xml = _pl_set_sheet_cells(data[sheet_path].decode('utf-8'), cell_edits)
+    xml_rows = [int(m.group(1)) for m in _PL_ROW_RE.finditer(sheet_xml)]
+    if not xml_rows:
+        raise ValueError('В листе не найдено строк для обработки')
+
+    row_info = _pl_read_row_groups(raw, sheet_name, max(xml_rows))
+    header_row = row_info['header_row']
+    removed = _pl_clean_remove_rows(remove_rows, header_row)
+    tabs = _pl_tab_rows_by_group(row_info, removed, header_row)
+    if not tabs:
+        return None, None
+
+    pivots_map = _pl_pivots_by_name(pivots)
+
+    # Оформление сводного блока добавляем в стили книги один раз
+    styles = None
+    if any(tab.get('pivot', True) and tab['name'] in pivots_map for tab in tabs) and 'xl/styles.xml' in data:
+        styles_xml, styles = _pl_pivot_styles(data['xl/styles.xml'].decode('utf-8'))
+        if styles:
+            data['xl/styles.xml'] = styles_xml.encode('utf-8')
+
+    warnings = []
+    for tab in tabs:
+        keep_set = set(tab['rows']) | set(range(1, header_row + 1))
+        extra = [r for r in xml_rows if r not in keep_set]
+        tab_xml, filter_info = _pl_filter_rows_xml(sheet_xml, extra)
+        if filter_info.get('warning'):
+            warnings.append(filter_info['warning'])
+        if styles and tab.get('pivot', True) and pivots_map.get(tab['name']):
+            tab_xml = _pl_append_pivot_block(tab_xml, pivots_map[tab['name']],
+                                             filter_info['rows_left'], styles)
+        tab['xml'] = _pl_set_sheet_uid(tab_xml)
+
+    return _pl_pack_group_workbook(data, infos, sheet_path, tabs, removed, xml_rows, warnings)
+
+
+def _pl_pack_group_workbook(data, infos, sheet_path, tabs, removed, xml_rows, warnings):
+    """Собирает книгу: исходные части + листы-вкладки со сводными таблицами."""
+    wb_xml = data['xl/workbook.xml'].decode('utf-8')
+    rels_path = 'xl/_rels/workbook.xml.rels'
+    rels_xml = data.get(rels_path, '').decode('utf-8')
+    sheet_meta = _pl_workbook_sheets(wb_xml, rels_xml)
+    max_rid = max([int(m) for m in re.findall(r'\bId="rId(\d+)"', rels_xml)] or [0])
+
+    other_sheets = [meta for meta in sheet_meta if meta[3] != sheet_path]
+    used_parts = set(data.keys())
+    used_names = {meta[0].lower() for meta in other_sheets}
+    next_sheet_num = 2
+    entries, new_rels, new_overrides = [], [], []
+
+    for index, tab in enumerate(tabs):
+        tab['sheet_name'] = _pl_safe_sheet_name(tab['name'], used_names)
+        if index == 0:
+            # Первая вкладка занимает XML исходного листа
+            part = sheet_path
+            rid = next((meta[2] for meta in sheet_meta if meta[3] == sheet_path), None)
+            if rid is None:
+                max_rid += 1
+                rid = f'rId{max_rid}'
+                new_rels.append((rid, part))
+                new_overrides.append(part)
+        else:
+            while f'xl/worksheets/sheet{next_sheet_num}.xml' in used_parts:
+                next_sheet_num += 1
+            part = f'xl/worksheets/sheet{next_sheet_num}.xml'
+            used_parts.add(part)
+            next_sheet_num += 1
+            max_rid += 1
+            rid = f'rId{max_rid}'
+            new_rels.append((rid, part))
+            new_overrides.append(part)
+        tab['part'] = part
+        data[part] = tab['xml'].encode('utf-8')
+        entries.append((tab['sheet_name'], rid, part))
+
+    # Прочие листы исходной книги оставляем без изменений — после вкладок
+    for name, _sheet_id, rid, part in other_sheets:
+        entries.append((name, rid, part))
+
+    # Настройки печати: связи исходного листа копируем новым вкладкам
+    base_rels_name = f'xl/worksheets/_rels/{os.path.basename(sheet_path)}.rels'
+    base_rels = data.get(base_rels_name)
+    for tab in tabs[1:]:
+        if base_rels and 'r:id="' in tab['xml']:
+            data[f'xl/worksheets/_rels/{os.path.basename(tab["part"])}.rels'] = base_rels
+
+    # workbook.xml — новый список листов
+    sheets_xml = ''.join(
+        f'<sheet name="{_pl_xml_escape(name)}" sheetId="{number}" r:id="{rid}"/>'
+        for number, (name, rid, _part) in enumerate(entries, start=1))
+    data['xl/workbook.xml'] = re.sub(
+        r'<sheets>.*?</sheets>', f'<sheets>{sheets_xml}</sheets>', wb_xml, flags=re.S).encode('utf-8')
+
+    # Связи книги и типы содержимого для новых листов
+    if new_rels:
+        additions = ''.join(
+            f'<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+            f'relationships/worksheet" Target="{part[len("xl/"):]}"/>' for rid, part in new_rels)
+        data[rels_path] = rels_xml.replace('</Relationships>', additions + '</Relationships>').encode('utf-8')
+    if new_overrides and '[Content_Types].xml' in data:
+        content_types = data['[Content_Types].xml'].decode('utf-8')
+        for part in new_overrides:
+            content_types = content_types.replace(
+                '</Types>',
+                f'<Override PartName="/{part}" ContentType="application/vnd.openxmlformats-'
+                f'officedocument.spreadsheetml.worksheet+xml"/></Types>')
+        data['[Content_Types].xml'] = content_types.encode('utf-8')
+
+    if 'docProps/app.xml' in data:
+        data['docProps/app.xml'] = _pl_update_app_xml(
+            data['docProps/app.xml'].decode('utf-8'),
+            [name for name, _rid, _part in entries]).encode('utf-8')
+
+    # Пересборка архива: исходный порядок частей + новые части
+    out = io.BytesIO()
+    written = set()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+        for entry in infos:
+            zi = zipfile.ZipInfo(entry.filename, date_time=entry.date_time)
+            zi.compress_type = entry.compress_type
+            zi.external_attr = entry.external_attr
+            zi.internal_attr = entry.internal_attr
+            zi.create_system = entry.create_system
+            zi.flag_bits = entry.flag_bits & ~0x08
+            z.writestr(zi, data[entry.filename])
+            written.add(entry.filename)
+        for name, blob in data.items():
+            if name not in written:
+                z.writestr(name, blob)
+    out.seek(0)
+
+    info = {
+        'removed': len(removed), 'sheet': sheet_path, 'rows_left': max(xml_rows),
+        'byte_identical': False, 'warning': '; '.join(dict.fromkeys(warnings)),
+        'tabs': [{'name': tab['sheet_name'], 'rows': len(tab['rows'])} for tab in tabs]
+    }
+    return out, info
 
 
 def _plp_build_rows(rows, month_first, period, stage):
@@ -2656,6 +3571,7 @@ def api_payment_limits_save():
     multipart/form-data:
       file — исходный .xlsx (нужен хотя бы один раз: без него нельзя выгрузить финальный файл)
       data — JSON: {stage: 'draft'|'final', rows: [...], removedRows: [...],
+                    rowEdits: {«номер строки»: {category, detail}},   ← правки «Тип оплаты»/«Детальный лимит»
                     period: 1..4, sheetName: '', fileName: '', author: '', registryId: N}
 
     Черновик сохраняет первичный вариант, финал — итоговый после проверки коллегой.
@@ -2673,6 +3589,9 @@ def api_payment_limits_save():
 
         rows = data.get('rows') or []
         removed_rows = data.get('removedRows') or []
+        row_edits = data.get('rowEdits')
+        if not isinstance(row_edits, dict):
+            row_edits = {}
         file = request.files.get('file')
         file_bytes = file.read() if file else None
 
@@ -2723,7 +3642,8 @@ def api_payment_limits_save():
             row_count=int(data.get('rowCount') or len(rows) or 0),
             removed_rows=removed_rows,
             author=(data.get('author') or '').strip(),
-            registry_id=registry_id
+            registry_id=registry_id,
+            row_edits=row_edits
         )
         if not reg_result.get('success'):
             return jsonify(reg_result), 500
@@ -2737,7 +3657,8 @@ def api_payment_limits_save():
         total_amount = sum(float(r.get('amount') or 0) for r in rows)
         stage_label = 'черновик' if stage == db.PLP_STAGE_DRAFT else 'финальный вариант'
         logger.info(f"✅ Сохранён {stage_label} лимитов: {save_result['count']} заявок, "
-                    f"снято {len(removed_rows)}, сумма {total_amount:.2f} ₽, P{period}, "
+                    f"снято {len(removed_rows)}, правок категорий {len(row_edits)}, "
+                    f"сумма {total_amount:.2f} ₽, P{period}, "
                     f"загрузка #{reg_result.get('registry_id')}, месяц {month_first}")
 
         return jsonify({
@@ -2747,6 +3668,8 @@ def api_payment_limits_save():
             'period': period,
             'count': save_result['count'],
             'removed_count': len(removed_rows),
+            'row_edits_count': len(row_edits),
+            'contractors_learned': int(save_result.get('contractors_learned') or 0),
             'total_amount': total_amount,
             'registry_id': reg_result.get('registry_id'),
             'new_registry': bool(reg_result.get('created')),
@@ -2815,6 +3738,24 @@ def api_payment_limits_reset():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/payment-limits/contractor-categories', methods=['GET'])
+def api_payment_limits_contractor_categories():
+    """
+    Справочник «контрагент → тип оплаты и детальный лимит» из прошлых загрузок.
+
+    Нужен браузеру, чтобы при загрузке файла автоматически подставлять категории
+    тем контрагентам, которых уже относили к лимитам ранее.
+    """
+    try:
+        categories = db.get_contractor_categories()
+        logger.info(f"Справочник контрагентов выдан: {len(categories)} записей")
+        return jsonify({'success': True, 'count': len(categories), 'categories': categories})
+    except Exception as e:
+        logger.error(f"Ошибка API payment-limits/contractor-categories: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/payment-limits/registry', methods=['GET'])
 def api_payment_limits_registry():
     """
@@ -2842,6 +3783,9 @@ def api_payment_limits_registry():
             item['file_size'] = int(item.get('file_size') or 0)
             item['draft_removed_rows'] = item.get('draft_removed_rows') or []
             item['final_removed_rows'] = item.get('final_removed_rows') or []
+            # Правки «Тип оплаты»/«Детальный лимит» по строкам файла (ключ — номер строки Excel)
+            item['draft_row_edits'] = item.get('draft_row_edits') or {}
+            item['final_row_edits'] = item.get('final_row_edits') or {}
             result.append(item)
 
         return jsonify({
@@ -2889,6 +3833,8 @@ def api_payment_limits_export():
       * сохранённый в БД реестр (data.registryId) — тогда файл из браузера не нужен.
     Снятые строки: data.removeRows (текущие отметки) либо сохранённый набор нужной стадии
     (data.stage = 'final' | 'draft'; по умолчанию финал, если он сохранён).
+    Разбивка по вкладкам: data.splitByGroup = true + data.groupSheets — сводные таблицы
+    блока «Пояснения» (браузер считает их так же, как показывает на экране).
     """
     try:
         try:
@@ -2900,8 +3846,15 @@ def api_payment_limits_export():
         stage = (data.get('stage') or '').strip().lower()
         sheet_name = (data.get('sheetName') or '').strip() or None
         remove_rows = data.get('removeRows')
+        split_by_group = bool(data.get('splitByGroup'))
+        group_sheets = data.get('groupSheets')
+        if not isinstance(group_sheets, list):
+            group_sheets = None
+        # Правки «Тип оплаты»/«Детальный лимит» → изменения конкретных ячеек листа
+        cell_edits = _pl_build_cell_edits(data.get('rowEdits'), data.get('editColumns'))
         file_name = None
         used_stage = None
+        used_split = False
 
         if 'file' in request.files:
             file = request.files['file']
@@ -2932,25 +3885,44 @@ def api_payment_limits_export():
             remove_rows = []
 
         try:
-            result, info = _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name)
+            result, info = (None, None)
+            if split_by_group:
+                # Разбивка по вкладкам-категориям (колонка «Группа») со сводными таблицами
+                result, info = _pl_split_sheets_by_group(raw, remove_rows, sheet_name, group_sheets,
+                                                         cell_edits)
+                used_split = result is not None
+            if result is None:
+                result, info = _pl_delete_rows_from_xlsx(raw, remove_rows, sheet_name,
+                                                         cell_edits=cell_edits)
+                if split_by_group:
+                    note = 'категории в колонке «Группа» не найдены — файл выгружен одним листом'
+                    info['warning'] = (info.get('warning') + '; ' if info.get('warning') else '') + note
         except zipfile.BadZipFile:
             return jsonify({'error': 'Экспорт доступен только для файлов .xlsx '
                                      '(файл не является книгой Excel 2007+). Сохраните реестр как .xlsx'}), 400
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
 
+        tabs = info.get('tabs') or []
         logger.info(f"✅ Экспорт реестра лимитов: файл «{file_name}»"
                     + (f" (реестр #{registry_id}, стадия «{stage or 'авто'}»)" if registry_id else '')
                     + f", снято строк {info['removed']}, осталось строк {info['rows_left']}, лист {info['sheet']}"
+                    + (f", правок в ячейках {sum(len(c) for c in cell_edits.values())}" if cell_edits else '')
+                    + (f", вкладок {len(tabs)}: "
+                       + ', '.join(f"{tab['name']} ({tab['rows']})" for tab in tabs) if tabs else '')
                     + (f", предупреждение: {info['warning']}" if info.get('warning') else ''))
 
         response = send_file(
             result,
             as_attachment=True,
-            download_name=f"Заявки_лимиты_{datetime.now().strftime('%d.%m.%Y')}.xlsx",
+            download_name=(f"Заявки_лимиты_по_категориям_{datetime.now().strftime('%d.%m.%Y')}.xlsx"
+                           if used_split else
+                           f"Заявки_лимиты_{datetime.now().strftime('%d.%m.%Y')}.xlsx"),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         response.headers['X-Export-Removed'] = str(info['removed'])
+        if tabs:
+            response.headers['X-Export-Tabs'] = str(len(tabs))
         if info.get('warning'):
             response.headers['X-Export-Warning'] = urllib.parse.quote(info['warning'])
 

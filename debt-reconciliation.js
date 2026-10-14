@@ -1782,6 +1782,7 @@ class DebtReconciliationManager {
     }
 
     _wrapBase64(str) {
+        // RFC 2045: строка base64 не длиннее 76 символов.
         let out = '';
         for (let i = 0; i < str.length; i += 76) {
             out += str.slice(i, i + 76) + '\r\n';
@@ -1803,7 +1804,7 @@ class DebtReconciliationManager {
         return out;
     }
 
-    _buildEml({ to, cc, subject, htmlBody, textBody, attachmentBase64, attachmentName, asciiName }) {
+    _buildEml({ to, cc, subject, htmlBody, textBody, attachmentBody, attachmentName, asciiName }) {
         const mixedBoundary = '----=_FA_' + Date.now() + '_' + Math.random().toString(36).slice(2);
         const altBoundary = '----=_FA_ALT_' + Date.now() + '_' + Math.random().toString(36).slice(2);
 
@@ -1845,7 +1846,9 @@ class DebtReconciliationManager {
         eml += 'Content-Disposition: attachment; filename="' + asciiName + '"; filename*=' + this._rfc2231EncodeFilename(attachmentName) + '\r\n';
         eml += 'Content-Transfer-Encoding: base64\r\n';
         eml += '\r\n';
-        eml += this._wrapBase64(attachmentBase64);
+        // Вложение уже разбито на строки по 76 символов вызывающим кодом:
+        // base64 вложения одинаково для всех писем, поэтому разбиваем один раз.
+        eml += attachmentBody;
         eml += '--' + mixedBoundary + '--\r\n';
 
         return eml;
@@ -1944,6 +1947,9 @@ class DebtReconciliationManager {
             }
 
             const attachmentBase64 = await this._blobToBase64(blob);
+            // Разбиваем base64 вложения один раз: оно одинаковое во всех
+            // трёх письмах, а это самая объёмная часть .eml (несколько МБ).
+            const attachmentBody = this._wrapBase64(attachmentBase64);
             const dateDDMMYYYY = this.formatDateDDMMYYYY(this.currentDate);
             const attachmentName = 'ДЗ Транспорт ' + dateDDMMYYYY + '.xlsx';
             const asciiName = 'ДЗ_Транспорт_' + dateDDMMYYYY + '.xlsx';
@@ -1965,7 +1971,7 @@ class DebtReconciliationManager {
                     subject: subject,
                     htmlBody: htmlBody,
                     textBody: textBody,
-                    attachmentBase64: attachmentBase64,
+                    attachmentBody: attachmentBody,
                     attachmentName: attachmentName,
                     asciiName: asciiName
                 });

@@ -604,6 +604,11 @@
                     <div class="date-selector">
                         <label for="calculationDate">Дата расчета:</label>
                         <input type="date" id="calculationDate">
+                        <label class="checkbox-label balances-interest-only" for="depositsInterestOnly"
+                               title="Тело длинных (срочных) депозитов, внесённых через форму, не прибавляется к остаткам: по вернувшимся депозитам учитываются только начисленные проценты, по ещё замороженным — ничего. Обычные депозиты из Excel-файла учитываются целиком (тело + проценты)">
+                            <input type="checkbox" id="depositsInterestOnly" checked>
+                            <span>Только проценты по длинным депозитам</span>
+                        </label>
                     </div>
 
                     <div class="summary-cards">
@@ -893,21 +898,15 @@
                                 <i class="fas fa-sliders-h"></i> Настроить лимиты
                             </button>
                             <button id="exportPaymentLimitsBtn" class="btn btn-success pl-export-btn" disabled
-                                    title="Скачать заявки в исходном формате файла (только отмеченные)">
+                                    title="Скачать заявки вкладками: «Общий свод» (весь список) и категории колонки «Группа» со сводными таблицами блока «Пояснения» (только отмеченные)">
                                 <i class="fas fa-file-excel"></i> Экспорт в Excel
                                 <span class="btn-badge" id="exportPaymentLimitsBadge" hidden
                                       title="Финальный вариант согласован — можно выгружать">1</span>
                             </button>
                             <button id="resetPaymentLimitsBtn" class="btn btn-danger"
-                                    title="Удалить ранее загруженные данные за текущий месяц: черновик, финальный вариант, платежи и исходный файл реестра. Позволяет пройти полный цикл заново">
+                                    title="Удалить ранее загруженные данные за выбранный период или за весь месяц: черновик, финальный вариант, платежи и исходный файл реестра. Позволяет пройти цикл заново">
                                 <i class="fas fa-eraser"></i> Обнулить загруженное
                             </button>
-                            <div class="pl-header-info">
-                                <span class="pl-info-item"><i class="fas fa-calendar-day"></i> Текущая дата: <strong id="plHeaderDate">—</strong></span>
-                                <span class="pl-info-item"><i class="fas fa-hourglass-half"></i> Период загрузки: <strong id="plHeaderPeriod">—</strong></span>
-                                <span class="pl-info-item"><i class="fas fa-calendar-alt"></i> Месяц учёта: <strong id="plHeaderMonth">—</strong></span>
-                                <span class="pl-info-item"><i class="fas fa-database"></i> Сохранённый вариант: <strong id="plRegistryState">—</strong></span>
-                            </div>
                         </div>
                     </div>
 
@@ -1587,7 +1586,7 @@
                 </h4>
                 <div style="display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 20px;">
                     <div>
-                        <label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; display: block; margin-bottom: 4px;">Не включая судебную задолженность (Промстрой, АккаунтЭксперт, МКСталь)</label>
+                        <label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; display: block; margin-bottom: 4px;">Не включая судебную задолженность (Промстрой, АккаунтЭксперт, МКСталь, Кройл)</label>
                         <input type="number" id="summaryDtLegal" step="0.01" placeholder="Сумма" style="width: 100%; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); font-size: 13px;">
                     </div>
                 </div>
@@ -1775,6 +1774,41 @@
                         <i class="fas fa-save"></i> Сохранить
                     </button>
                 </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно: обнуление загруженных данных за период или за месяц -->
+    <div id="paymentLimitsResetModal" class="modal">
+        <div class="modal-content" style="max-width: 520px;">
+            <div class="modal-header">
+                <h3><i class="fas fa-eraser"></i> Обнулить загруженное</h3>
+                <span class="close-modal" id="closePaymentLimitsResetModal">&times;</span>
+            </div>
+            <div class="modal-body">
+                <p class="pl-editor-hint">Выберите, что обнулить: один период или весь месяц целиком.</p>
+                <label class="pl-reset-field">
+                    <span>Обнулить:</span>
+                    <select id="plResetPeriod">
+                        <option value="">Весь месяц (все периоды)</option>
+                        <option value="1">Период 1 (1–7 числа)</option>
+                        <option value="2">Период 2 (8–15 числа)</option>
+                        <option value="3">Период 3 (16–22 числа)</option>
+                        <option value="4">Период 4 (23–31 числа)</option>
+                    </select>
+                </label>
+                <p class="pl-reset-note" id="plResetInfo" style="font-weight:600;"></p>
+                <p class="pl-reset-note">
+                    Будут удалены: сохранённые черновик и финальный вариант, платежи и исходный файл реестра
+                    выбранного периода. Справочник «контрагент → категория лимита» не затрагивается —
+                    подстановка категорий продолжит работать.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary close-modal">Отмена</button>
+                <button id="plResetConfirmBtn" class="btn btn-danger">
+                    <i class="fas fa-eraser"></i> Обнулить
+                </button>
             </div>
         </div>
     </div>
